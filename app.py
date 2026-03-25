@@ -1,381 +1,278 @@
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request
 from flask_cors import CORS
-import sqlite3
-import os
+from sqlalchemy import create_engine, text
 from datetime import datetime
+import os
+import json
 
-app = Flask(__name__, static_folder='static', template_folder='templates')
+app = Flask(__name__)
 CORS(app)
 
-DB = os.path.join(os.path.dirname(__file__), 'openaeth.db')
+DATABASE_URL = os.environ.get(
+    'DATABASE_URL',
+    'postgresql://postgres:[YOUR-PASSWORD]@db.bgjjmeenermkwxqewaml.supabase.co:5432/postgres'
+)
 
-def get_db():
-    conn = sqlite3.connect(DB)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+# Connection pool — reused across requests, thread-safe
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=5,
+    max_overflow=10,
+    pool_pre_ping=True,   # verifica conexiones muertas antes de usarlas
+    pool_recycle=300,     # recicla conexiones cada 5 min (evita cortes de Supabase)
+)
 
-def init_db():
-    with get_db() as db:
-        db.executescript("""
-        CREATE TABLE IF NOT EXISTS contacts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            medio TEXT,
-            empresa TEXT,
-            tipo TEXT DEFAULT 'prensa',
-            status TEXT DEFAULT 'nuevo',
-            email TEXT,
-            telefono TEXT,
-            last_contact TEXT,
-            next_followup TEXT,
-            notes TEXT,
-            created_at TEXT DEFAULT (datetime('now')),
-            updated_at TEXT DEFAULT (datetime('now'))
-        );
-
-        CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            icon TEXT DEFAULT '📦',
-            description TEXT,
-            status TEXT DEFAULT 'activo',
-            color TEXT DEFAULT '#00e5ff',
-            sort_order INTEGER DEFAULT 0,
-            created_at TEXT DEFAULT (datetime('now')),
-            updated_at TEXT DEFAULT (datetime('now'))
-        );
-
-        CREATE TABLE IF NOT EXISTS tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_id INTEGER REFERENCES products(id),
-            module TEXT NOT NULL,
-            name TEXT NOT NULL,
-            description TEXT,
-            status TEXT DEFAULT 'todo',
-            priority TEXT DEFAULT 'medio',
-            impact TEXT DEFAULT 'medio',
-            done INTEGER DEFAULT 0,
-            created_at TEXT DEFAULT (datetime('now')),
-            updated_at TEXT DEFAULT (datetime('now'))
-        );
-
-        CREATE TABLE IF NOT EXISTS campaigns (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            icon TEXT DEFAULT '📊',
-            visitas INTEGER DEFAULT 0,
-            conversion REAL DEFAULT 0,
-            leads INTEGER DEFAULT 0,
-            backers INTEGER DEFAULT 0,
-            notes TEXT,
-            created_at TEXT DEFAULT (datetime('now')),
-            updated_at TEXT DEFAULT (datetime('now'))
-        );
-
-        CREATE TABLE IF NOT EXISTS strategy_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            type TEXT NOT NULL,
-            title TEXT,
-            text TEXT NOT NULL,
-            links TEXT DEFAULT '[]',
-            date TEXT DEFAULT (date('now')),
-            created_at TEXT DEFAULT (datetime('now'))
-        );
-
-        CREATE TABLE IF NOT EXISTS contact_interactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            contact_id INTEGER,
-            type TEXT,
-            note TEXT,
-            date TEXT DEFAULT (date('now')),
-            FOREIGN KEY(contact_id) REFERENCES contacts(id)
-        );
-        """)
-        # Migration: add product_id to tasks if upgrading from older schema
-        cols = [r[1] for r in db.execute("PRAGMA table_info(tasks)").fetchall()]
-        if 'product_id' not in cols:
-            db.execute("ALTER TABLE tasks ADD COLUMN product_id INTEGER REFERENCES products(id)")
-
-        # Seed data if empty (demo data for first run)
-        cur = db.execute("SELECT COUNT(*) as c FROM contacts")
-        if cur.fetchone()['c'] == 0:
-            db.executemany("""INSERT INTO contacts (name,medio,empresa,tipo,status,last_contact,next_followup,notes) VALUES (?,?,?,?,?,?,?,?)""", [
-                ('Valentina Cruz','TechCrunch ES','TechCrunch','prensa','contactado','2025-01-18','2025-01-25','Interesada en IA conversacional para startups LATAM'),
-                ('Marcos Oliveira','YC Alumni','YC W23','partner','en conversacion','2025-01-17','2025-01-22','Posible co-inversor. Tiene red en Brasil y México.'),
-                ('SaaS Demo Corp','LinkedIn','SaaS Demo','cliente','interesado','2025-01-15','2025-01-21','Quieren integrar Multi-IA en soporte al cliente'),
-                ('Diego Herrera','Twitter/X','Freelance','prensa','nuevo','','2025-01-22','Tech journalist, 40k seguidores. Cubre IA y startups.'),
-                ('Ana Rivas','ProductHunt','PH','partner','cerrado','2025-01-10','','Deal cerrado. Lanzamiento en PH coordinado.'),
-            ])
-
-        cur2 = db.execute("SELECT COUNT(*) as c FROM tasks")
-        if cur2.fetchone()['c'] == 0:
-            db.executemany("INSERT INTO tasks (module,name,description,status,priority,impact,done) VALUES (?,?,?,?,?,?,?)", [
-                ('Auth','OAuth2 con Google','Flujo completo de autenticación Google','done','alto','alto',1),
-                ('Auth','JWT refresh tokens','Implementar renovación automática de tokens','done','alto','alto',1),
-                ('Auth','2FA via TOTP','Autenticación de dos factores','todo','medio','medio',0),
-                ('Backend','API endpoints REST','CRUD completo para todas las entidades','doing','alto','alto',0),
-                ('Backend','Rate limiting','Throttling por usuario y plan','todo','medio','medio',0),
-                ('Backend','Webhooks sistema','Notificaciones a sistemas externos','todo','medio','alto',0),
-                ('Backend','Caché Redis','Caching de respuestas frecuentes','todo','bajo','medio',0),
-                ('UI','Onboarding flow','Wizard de configuración inicial','doing','alto','alto',0),
-                ('UI','Dashboard métricas','Visualización de uso y costos','todo','medio','medio',0),
-                ('UI','Chat widget embed','Widget embebible para clientes','todo','alto','alto',0),
-                ('Multi-IA','Conector GPT-4','Integración OpenAI completa','done','alto','alto',1),
-                ('Multi-IA','Conector Claude','Integración Anthropic API','doing','alto','alto',0),
-                ('Multi-IA','Router de modelos','Selección automática por costo/calidad','todo','alto','alto',0),
-                ('Multi-IA','Fallback automático','Redirigir si un modelo falla','todo','alto','alto',0),
-            ])
-
-        cur3 = db.execute("SELECT COUNT(*) as c FROM campaigns")
-        if cur3.fetchone()['c'] == 0:
-            db.executemany("INSERT INTO campaigns (name,icon,visitas,conversion,leads,backers,notes) VALUES (?,?,?,?,?,?,?)", [
-                ('Landing','🏠',1240,3.2,40,12,'Iterar CTA principal. El headline actual convierte poco. Probar "sin código" como hook.'),
-                ('Recompensas','🎁',340,8.8,30,8,'Tier $99 tiene mejor conversión. Agregar testimonial de beta user.'),
-                ('Video Demo','🎬',560,2.1,12,3,'Demo 90s funciona mejor que 3min. Agregar subtítulos en español.'),
-                ('Prensa','📰',180,5.5,10,2,'Primer artículo en AI Weekly. Preparar kit de prensa con screenshots.'),
-            ])
-
-        cur4 = db.execute("SELECT COUNT(*) as c FROM strategy_logs")
-        if cur4.fetchone()['c'] == 0:
-            db.executemany("INSERT INTO strategy_logs (type,title,text,links,date) VALUES (?,?,?,?,?)", [
-                ('Decision','Pricing SMB','Pivotamos el pricing a $99/mes para SMBs. Enterprise queda para v2.','["CRM→Marcos","DEV→Backend"]','2025-01-18'),
-                ('Insight','Canal Twitter','Los leads de Twitter convierten 3x más rápido que LinkedIn. Redirigir esfuerzo.','["Campaña→Landing"]','2025-01-17'),
-                ('Riesgo','Dependencia OpenAI','Multi-IA dependency en OpenAI. Si sube precios >40%, el margen colapsa.','["DEV→Multi-IA"]','2025-01-16'),
-                ('Oportunidad','Vertical HR','3 empresas de HR preguntaron por integración con ATS. Sin competidor directo.','["CRM→SaaS Demo"]','2025-01-15'),
-            ])
+def row_to_dict(row):
+    """Convierte una Row de SQLAlchemy a dict serializable."""
+    d = dict(row._mapping)
+    for k, v in d.items():
+        if hasattr(v, 'isoformat'):   # date / datetime / timestamptz
+            d[k] = v.isoformat()
+    return d
 
 # ── CONTACTS ─────────────────────────────────────────────────────────────────
 @app.route('/api/contacts', methods=['GET'])
 def get_contacts():
-    with get_db() as db:
-        rows = db.execute("SELECT * FROM contacts ORDER BY updated_at DESC").fetchall()
-        return jsonify([dict(r) for r in rows])
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT * FROM contacts ORDER BY updated_at DESC")).fetchall()
+        return jsonify([row_to_dict(r) for r in rows])
 
 @app.route('/api/contacts', methods=['POST'])
 def create_contact():
     d = request.json
-    with get_db() as db:
-        cur = db.execute("""INSERT INTO contacts (name,medio,empresa,tipo,status,email,telefono,last_contact,next_followup,notes)
-            VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            (d.get('name',''), d.get('medio',''), d.get('empresa',''), d.get('tipo','prensa'),
-             d.get('status','nuevo'), d.get('email',''), d.get('telefono',''),
-             d.get('last_contact',''), d.get('next_followup',''), d.get('notes','')))
-        row = db.execute("SELECT * FROM contacts WHERE id=?", (cur.lastrowid,)).fetchone()
-        return jsonify(dict(row)), 201
+    with engine.begin() as conn:
+        row = conn.execute(text("""
+            INSERT INTO contacts (name,medio,empresa,tipo,status,email,telefono,last_contact,next_followup,notes)
+            VALUES (:name,:medio,:empresa,:tipo,:status,:email,:telefono,:last_contact,:next_followup,:notes)
+            RETURNING *
+        """), {
+            'name': d.get('name',''), 'medio': d.get('medio',''), 'empresa': d.get('empresa',''),
+            'tipo': d.get('tipo','prensa'), 'status': d.get('status','nuevo'),
+            'email': d.get('email',''), 'telefono': d.get('telefono',''),
+            'last_contact': d.get('last_contact',''), 'next_followup': d.get('next_followup',''),
+            'notes': d.get('notes',''),
+        }).fetchone()
+        return jsonify(row_to_dict(row)), 201
 
 @app.route('/api/contacts/<int:cid>', methods=['PUT'])
 def update_contact(cid):
     d = request.json
-    with get_db() as db:
-        db.execute("""UPDATE contacts SET name=?,medio=?,empresa=?,tipo=?,status=?,email=?,telefono=?,
-            last_contact=?,next_followup=?,notes=?,updated_at=datetime('now') WHERE id=?""",
-            (d.get('name'), d.get('medio'), d.get('empresa'), d.get('tipo'),
-             d.get('status'), d.get('email'), d.get('telefono'),
-             d.get('last_contact'), d.get('next_followup'), d.get('notes'), cid))
-        row = db.execute("SELECT * FROM contacts WHERE id=?", (cid,)).fetchone()
-        return jsonify(dict(row))
+    with engine.begin() as conn:
+        row = conn.execute(text("""
+            UPDATE contacts SET name=:name,medio=:medio,empresa=:empresa,tipo=:tipo,status=:status,
+            email=:email,telefono=:telefono,last_contact=:last_contact,next_followup=:next_followup,
+            notes=:notes,updated_at=NOW()
+            WHERE id=:id RETURNING *
+        """), {**d, 'id': cid}).fetchone()
+        return jsonify(row_to_dict(row))
 
 @app.route('/api/contacts/<int:cid>', methods=['DELETE'])
 def delete_contact(cid):
-    with get_db() as db:
-        db.execute("DELETE FROM contacts WHERE id=?", (cid,))
-        db.execute("DELETE FROM contact_interactions WHERE contact_id=?", (cid,))
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM contact_interactions WHERE contact_id=:id"), {'id': cid})
+        conn.execute(text("DELETE FROM contacts WHERE id=:id"), {'id': cid})
         return jsonify({'ok': True})
 
 @app.route('/api/contacts/<int:cid>/status', methods=['PATCH'])
 def patch_contact_status(cid):
     d = request.json
-    with get_db() as db:
-        db.execute("UPDATE contacts SET status=?,updated_at=datetime('now') WHERE id=?", (d['status'], cid))
-        row = db.execute("SELECT * FROM contacts WHERE id=?", (cid,)).fetchone()
-        return jsonify(dict(row))
+    with engine.begin() as conn:
+        row = conn.execute(text(
+            "UPDATE contacts SET status=:status,updated_at=NOW() WHERE id=:id RETURNING *"
+        ), {'status': d['status'], 'id': cid}).fetchone()
+        return jsonify(row_to_dict(row))
 
 # ── PRODUCTS ──────────────────────────────────────────────────────────────────
 @app.route('/api/products', methods=['GET'])
 def get_products():
-    with get_db() as db:
-        rows = db.execute("SELECT * FROM products ORDER BY sort_order, id").fetchall()
-        return jsonify([dict(r) for r in rows])
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT * FROM products ORDER BY sort_order, id")).fetchall()
+        return jsonify([row_to_dict(r) for r in rows])
 
 @app.route('/api/products', methods=['POST'])
 def create_product():
     d = request.json
-    with get_db() as db:
-        max_order = db.execute("SELECT COALESCE(MAX(sort_order),0)+1 as n FROM products").fetchone()['n']
-        cur = db.execute("""INSERT INTO products (name,icon,description,status,color,sort_order)
-            VALUES (?,?,?,?,?,?)""",
-            (d.get('name'), d.get('icon','📦'), d.get('description',''),
-             d.get('status','activo'), d.get('color','#00e5ff'), max_order))
-        row = db.execute("SELECT * FROM products WHERE id=?", (cur.lastrowid,)).fetchone()
-        return jsonify(dict(row)), 201
+    with engine.begin() as conn:
+        max_order = conn.execute(text("SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM products")).scalar()
+        row = conn.execute(text("""
+            INSERT INTO products (name,icon,description,status,color,sort_order)
+            VALUES (:name,:icon,:description,:status,:color,:sort_order)
+            RETURNING *
+        """), {
+            'name': d.get('name'), 'icon': d.get('icon','📦'),
+            'description': d.get('description',''), 'status': d.get('status','activo'),
+            'color': d.get('color','#00e5ff'), 'sort_order': max_order,
+        }).fetchone()
+        return jsonify(row_to_dict(row)), 201
 
 @app.route('/api/products/<int:pid>', methods=['PUT'])
 def update_product(pid):
     d = request.json
-    with get_db() as db:
-        db.execute("""UPDATE products SET name=?,icon=?,description=?,status=?,color=?,
-            updated_at=datetime('now') WHERE id=?""",
-            (d.get('name'), d.get('icon'), d.get('description'),
-             d.get('status'), d.get('color'), pid))
-        row = db.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
-        return jsonify(dict(row))
+    with engine.begin() as conn:
+        row = conn.execute(text("""
+            UPDATE products SET name=:name,icon=:icon,description=:description,status=:status,
+            color=:color,updated_at=NOW() WHERE id=:id RETURNING *
+        """), {**d, 'id': pid}).fetchone()
+        return jsonify(row_to_dict(row))
 
 @app.route('/api/products/<int:pid>', methods=['DELETE'])
 def delete_product(pid):
-    with get_db() as db:
-        db.execute("DELETE FROM tasks WHERE product_id=?", (pid,))
-        db.execute("DELETE FROM products WHERE id=?", (pid,))
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM tasks WHERE product_id=:id"), {'id': pid})
+        conn.execute(text("DELETE FROM products WHERE id=:id"), {'id': pid})
         return jsonify({'ok': True})
 
 # ── TASKS ─────────────────────────────────────────────────────────────────────
 @app.route('/api/tasks', methods=['GET'])
 def get_tasks():
-    with get_db() as db:
-        rows = db.execute("SELECT * FROM tasks ORDER BY product_id, module, id").fetchall()
-        return jsonify([dict(r) for r in rows])
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT * FROM tasks ORDER BY product_id, module, id")).fetchall()
+        return jsonify([row_to_dict(r) for r in rows])
 
 @app.route('/api/tasks', methods=['POST'])
 def create_task():
     d = request.json
-    with get_db() as db:
-        cur = db.execute("""INSERT INTO tasks (product_id,module,name,description,status,priority,impact,done)
-            VALUES (?,?,?,?,?,?,?,?)""",
-            (d.get('product_id'), d.get('module','Backend'), d.get('name'), d.get('description',''),
-             d.get('status','todo'), d.get('priority','medio'), d.get('impact','medio'),
-             1 if d.get('status') == 'done' else 0))
-        row = db.execute("SELECT * FROM tasks WHERE id=?", (cur.lastrowid,)).fetchone()
-        return jsonify(dict(row)), 201
+    with engine.begin() as conn:
+        row = conn.execute(text("""
+            INSERT INTO tasks (product_id,module,name,description,status,priority,impact,done)
+            VALUES (:product_id,:module,:name,:description,:status,:priority,:impact,:done)
+            RETURNING *
+        """), {
+            'product_id': d.get('product_id'), 'module': d.get('module','Backend'),
+            'name': d.get('name'), 'description': d.get('description',''),
+            'status': d.get('status','todo'), 'priority': d.get('priority','medio'),
+            'impact': d.get('impact','medio'),
+            'done': 1 if d.get('status') == 'done' else 0,
+        }).fetchone()
+        return jsonify(row_to_dict(row)), 201
 
 @app.route('/api/tasks/<int:tid>', methods=['PUT'])
 def update_task(tid):
     d = request.json
     done = 1 if d.get('done') or d.get('status') == 'done' else 0
-    with get_db() as db:
-        db.execute("""UPDATE tasks SET product_id=?,module=?,name=?,description=?,status=?,priority=?,impact=?,done=?,
-            updated_at=datetime('now') WHERE id=?""",
-            (d.get('product_id'), d.get('module'), d.get('name'), d.get('description'), d.get('status'),
-             d.get('priority'), d.get('impact'), done, tid))
-        row = db.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
-        return jsonify(dict(row))
+    with engine.begin() as conn:
+        row = conn.execute(text("""
+            UPDATE tasks SET product_id=:product_id,module=:module,name=:name,description=:description,
+            status=:status,priority=:priority,impact=:impact,done=:done,updated_at=NOW()
+            WHERE id=:id RETURNING *
+        """), {**d, 'done': done, 'id': tid}).fetchone()
+        return jsonify(row_to_dict(row))
 
 @app.route('/api/tasks/<int:tid>/toggle', methods=['PATCH'])
 def toggle_task(tid):
-    with get_db() as db:
-        row = db.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
-        new_done = 0 if row['done'] else 1
+    with engine.begin() as conn:
+        current = conn.execute(text("SELECT done FROM tasks WHERE id=:id"), {'id': tid}).fetchone()
+        new_done   = 0 if current.done else 1
         new_status = 'done' if new_done else 'doing'
-        db.execute("UPDATE tasks SET done=?,status=?,updated_at=datetime('now') WHERE id=?",
-                   (new_done, new_status, tid))
-        row = db.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
-        return jsonify(dict(row))
+        row = conn.execute(text(
+            "UPDATE tasks SET done=:done,status=:status,updated_at=NOW() WHERE id=:id RETURNING *"
+        ), {'done': new_done, 'status': new_status, 'id': tid}).fetchone()
+        return jsonify(row_to_dict(row))
 
 @app.route('/api/tasks/<int:tid>', methods=['DELETE'])
 def delete_task(tid):
-    with get_db() as db:
-        db.execute("DELETE FROM tasks WHERE id=?", (tid,))
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM tasks WHERE id=:id"), {'id': tid})
         return jsonify({'ok': True})
 
 # ── CAMPAIGNS ─────────────────────────────────────────────────────────────────
 @app.route('/api/campaigns', methods=['GET'])
 def get_campaigns():
-    with get_db() as db:
-        rows = db.execute("SELECT * FROM campaigns ORDER BY id").fetchall()
-        return jsonify([dict(r) for r in rows])
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT * FROM campaigns ORDER BY id")).fetchall()
+        return jsonify([row_to_dict(r) for r in rows])
 
 @app.route('/api/campaigns', methods=['POST'])
 def create_campaign():
     d = request.json
-    with get_db() as db:
-        cur = db.execute("""INSERT INTO campaigns (name,icon,visitas,conversion,leads,backers,notes)
-            VALUES (?,?,?,?,?,?,?)""",
-            (d.get('name'), d.get('icon','📊'), d.get('visitas',0),
-             d.get('conversion',0), d.get('leads',0), d.get('backers',0), d.get('notes','')))
-        row = db.execute("SELECT * FROM campaigns WHERE id=?", (cur.lastrowid,)).fetchone()
-        return jsonify(dict(row)), 201
+    with engine.begin() as conn:
+        row = conn.execute(text("""
+            INSERT INTO campaigns (name,icon,visitas,conversion,leads,backers,notes)
+            VALUES (:name,:icon,:visitas,:conversion,:leads,:backers,:notes)
+            RETURNING *
+        """), {
+            'name': d.get('name'), 'icon': d.get('icon','📊'),
+            'visitas': d.get('visitas',0), 'conversion': d.get('conversion',0),
+            'leads': d.get('leads',0), 'backers': d.get('backers',0),
+            'notes': d.get('notes',''),
+        }).fetchone()
+        return jsonify(row_to_dict(row)), 201
 
 @app.route('/api/campaigns/<int:cid>', methods=['PUT'])
 def update_campaign(cid):
     d = request.json
-    with get_db() as db:
-        db.execute("""UPDATE campaigns SET name=?,icon=?,visitas=?,conversion=?,leads=?,backers=?,notes=?,
-            updated_at=datetime('now') WHERE id=?""",
-            (d.get('name'), d.get('icon'), d.get('visitas',0), d.get('conversion',0),
-             d.get('leads',0), d.get('backers',0), d.get('notes'), cid))
-        row = db.execute("SELECT * FROM campaigns WHERE id=?", (cid,)).fetchone()
-        return jsonify(dict(row))
+    with engine.begin() as conn:
+        row = conn.execute(text("""
+            UPDATE campaigns SET name=:name,icon=:icon,visitas=:visitas,conversion=:conversion,
+            leads=:leads,backers=:backers,notes=:notes,updated_at=NOW()
+            WHERE id=:id RETURNING *
+        """), {**d, 'id': cid}).fetchone()
+        return jsonify(row_to_dict(row))
 
 @app.route('/api/campaigns/<int:cid>', methods=['DELETE'])
 def delete_campaign(cid):
-    with get_db() as db:
-        db.execute("DELETE FROM campaigns WHERE id=?", (cid,))
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM campaigns WHERE id=:id"), {'id': cid})
         return jsonify({'ok': True})
 
-# ── STRATEGY ──────────────────────────────────────────────────────────────────
+# ── STRATEGY LOGS ─────────────────────────────────────────────────────────────
 @app.route('/api/logs', methods=['GET'])
 def get_logs():
-    with get_db() as db:
-        rows = db.execute("SELECT * FROM strategy_logs ORDER BY created_at DESC").fetchall()
-        import json
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT * FROM strategy_logs ORDER BY created_at DESC")).fetchall()
         result = []
         for r in rows:
-            d = dict(r)
-            try: d['links'] = json.loads(d['links'] or '[]')
+            d = row_to_dict(r)
+            try:    d['links'] = json.loads(d['links'] or '[]')
             except: d['links'] = []
             result.append(d)
         return jsonify(result)
 
 @app.route('/api/logs', methods=['POST'])
 def create_log():
-    import json
     d = request.json
-    links = json.dumps(d.get('links', []))
-    with get_db() as db:
-        cur = db.execute("""INSERT INTO strategy_logs (type,title,text,links,date) VALUES (?,?,?,?,?)""",
-            (d.get('type','Insight'), d.get('title',''), d.get('text'), links,
-             d.get('date', datetime.now().strftime('%Y-%m-%d'))))
-        row = db.execute("SELECT * FROM strategy_logs WHERE id=?", (cur.lastrowid,)).fetchone()
-        result = dict(row)
-        try: result['links'] = json.loads(result['links'] or '[]')
+    with engine.begin() as conn:
+        row = conn.execute(text("""
+            INSERT INTO strategy_logs (type,title,text,links,date)
+            VALUES (:type,:title,:text,:links,:date)
+            RETURNING *
+        """), {
+            'type':  d.get('type','Insight'),
+            'title': d.get('title',''),
+            'text':  d.get('text'),
+            'links': json.dumps(d.get('links', [])),
+            'date':  d.get('date', datetime.now().strftime('%Y-%m-%d')),
+        }).fetchone()
+        result = row_to_dict(row)
+        try:    result['links'] = json.loads(result['links'] or '[]')
         except: result['links'] = []
         return jsonify(result), 201
 
 @app.route('/api/logs/<int:lid>', methods=['DELETE'])
 def delete_log(lid):
-    with get_db() as db:
-        db.execute("DELETE FROM strategy_logs WHERE id=?", (lid,))
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM strategy_logs WHERE id=:id"), {'id': lid})
         return jsonify({'ok': True})
 
 # ── STATS ─────────────────────────────────────────────────────────────────────
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
-    with get_db() as db:
-        contacts_total = db.execute("SELECT COUNT(*) as c FROM contacts").fetchone()['c']
-        contacts_active = db.execute("SELECT COUNT(*) as c FROM contacts WHERE status != 'cerrado'").fetchone()['c']
-        tasks_doing = db.execute("SELECT COUNT(*) as c FROM tasks WHERE status='doing'").fetchone()['c']
-        tasks_todo = db.execute("SELECT COUNT(*) as c FROM tasks WHERE status='todo'").fetchone()['c']
-        tasks_done = db.execute("SELECT COUNT(*) as c FROM tasks WHERE done=1").fetchone()['c']
-        tasks_total = db.execute("SELECT COUNT(*) as c FROM tasks").fetchone()['c']
-        insights = db.execute("SELECT COUNT(*) as c FROM strategy_logs WHERE type='Insight'").fetchone()['c']
-        logs_total = db.execute("SELECT COUNT(*) as c FROM strategy_logs").fetchone()['c']
-        products_total = db.execute("SELECT COUNT(*) as c FROM products").fetchone()['c']
-        products_active = db.execute("SELECT COUNT(*) as c FROM products WHERE status='activo'").fetchone()['c']
-        return jsonify({
-            'contacts_total': contacts_total,
-            'contacts_active': contacts_active,
-            'tasks_doing': tasks_doing,
-            'tasks_todo': tasks_todo,
-            'tasks_done': tasks_done,
-            'tasks_total': tasks_total,
-            'insights': insights,
-            'logs_total': logs_total,
-            'products_total': products_total,
-            'products_active': products_active,
-        })
+    queries = {
+        'contacts_total':  "SELECT COUNT(*) FROM contacts",
+        'contacts_active': "SELECT COUNT(*) FROM contacts WHERE status != 'cerrado'",
+        'tasks_doing':     "SELECT COUNT(*) FROM tasks WHERE status='doing'",
+        'tasks_todo':      "SELECT COUNT(*) FROM tasks WHERE status='todo'",
+        'tasks_done':      "SELECT COUNT(*) FROM tasks WHERE done=1",
+        'tasks_total':     "SELECT COUNT(*) FROM tasks",
+        'insights':        "SELECT COUNT(*) FROM strategy_logs WHERE type='Insight'",
+        'logs_total':      "SELECT COUNT(*) FROM strategy_logs",
+        'products_total':  "SELECT COUNT(*) FROM products",
+        'products_active': "SELECT COUNT(*) FROM products WHERE status='activo'",
+    }
+    with engine.connect() as conn:
+        return jsonify({k: conn.execute(text(v)).scalar() for k, v in queries.items()})
 
-# ── SERVE FRONTEND ────────────────────────────────────────────────────────────
-HERE = os.path.dirname(os.path.abspath(__file__))
-
+# ── SERVE FRONTEND ──────────────────────────────────────────────────────────
 HTML = """
 
 
@@ -1709,15 +1606,11 @@ boot();
 </html>
 """
 
-
 @app.route('/')
 def index():
     return HTML, 200, {'Content-Type': 'text/html; charset=utf-8'}
 
-# Initialize DB on startup (works both with gunicorn and direct run)
-init_db()
-
 if __name__ == '__main__':
-    print(f"\n  OpenAETH Command Core")
-    print(f"  → http://localhost:5000\n")
+    print("\n  OpenAETH Command Core — Supabase / PostgreSQL")
+    print("  → http://localhost:5000\n")
     app.run(debug=False, host='0.0.0.0', port=5000)
