@@ -14,9 +14,40 @@ DATABASE_URL = os.environ.get(
 )
 
 # Connection pool — reused across requests, thread-safe
-# Supabase requiere SSL — lo forzamos por código para no depender del formato de la URL
+# ── Supabase connection ───────────────────────────────────────────────────────
+# Render resuelve el host directo de Supabase (db.xxx.supabase.co) por IPv6,
+# pero Supabase solo acepta IPv4 desde clientes externos.
+# Solución: reemplazar el host por el Session Pooler de Supabase
+# (aws-0-<region>.pooler.supabase.com, puerto 6543) que siempre resuelve IPv4.
+# La variable DATABASE_URL mantiene el formato estándar; el código hace el swap.
+
+import socket as _socket
+import re as _re
+
+def _to_pooler_url(url: str) -> str:
+    """
+    Transforma la URL de conexión directa de Supabase al Session Pooler IPv4.
+    Entrada:  postgresql://postgres:pass@db.PROJECTREF.supabase.co:5432/postgres
+    Salida:   postgresql://postgres.PROJECTREF:pass@aws-0-us-east-1.pooler.supabase.com:6543/postgres
+    Si la URL ya usa el pooler o no matchea el patrón, la devuelve sin cambios.
+    """
+    m = _re.match(
+        r'(postgresql://)(postgres):([^@]+)@db\.([^.]+)\.supabase\.co:5432/postgres',
+        url
+    )
+    if not m:
+        return url
+    scheme, user, password, project_ref = m.group(1), m.group(2), m.group(3), m.group(4)
+    # Session Pooler URL — región us-east-1 cubre la mayoría de proyectos Supabase
+    # Si tu proyecto está en otra región, ajustá el host manualmente en DATABASE_URL
+    pooler_host = f'aws-0-us-east-1.pooler.supabase.com'
+    pooler_user = f'{user}.{project_ref}'
+    return f'{scheme}{pooler_user}:{password}@{pooler_host}:6543/postgres'
+
+_DATABASE_URL = _to_pooler_url(DATABASE_URL)
+
 engine = create_engine(
-    DATABASE_URL,
+    _DATABASE_URL,
     pool_size=5,
     max_overflow=10,
     pool_pre_ping=True,
@@ -277,12 +308,14 @@ def get_stats():
 # ── HEALTH CHECK ─────────────────────────────────────────────────────────────
 @app.route('/api/health', methods=['GET'])
 def health():
+    # Muestra la URL efectiva (sin password) para debug
+    safe_url = _re.sub(r':([^@]+)@', ':***@', _DATABASE_URL)
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-        return jsonify({'status': 'ok', 'db': 'connected'})
+        return jsonify({'status': 'ok', 'db': 'connected', 'url': safe_url})
     except Exception as e:
-        return jsonify({'status': 'error', 'db': str(e)}), 500
+        return jsonify({'status': 'error', 'db': str(e), 'url': safe_url}), 500
 
 # ── SERVE FRONTEND ──────────────────────────────────────────────────────────
 HTML = """
