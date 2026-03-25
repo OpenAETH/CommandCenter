@@ -1,9 +1,13 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from sqlalchemy import create_engine, text
+from sqlalchemy.pool import QueuePool
 from datetime import datetime
 import os
 import json
+import socket
+import psycopg2
+import psycopg2.extras
 
 app = Flask(__name__)
 CORS(app)
@@ -15,44 +19,60 @@ DATABASE_URL = os.environ.get(
 
 # Connection pool — reused across requests, thread-safe
 # ── Supabase connection ───────────────────────────────────────────────────────
-# Render resuelve el host directo de Supabase (db.xxx.supabase.co) por IPv6,
-# pero Supabase solo acepta IPv4 desde clientes externos.
-# Solución: reemplazar el host por el Session Pooler de Supabase
-# (aws-0-<region>.pooler.supabase.com, puerto 6543) que siempre resuelve IPv4.
-# La variable DATABASE_URL mantiene el formato estándar; el código hace el swap.
+# Render resuelve db.xxx.supabase.co como IPv6, pero Supabase solo acepta IPv4.
+# Solución: creador de conexiones personalizado con psycopg2 que resuelve el host
+# explícitamente como IPv4 (socket.AF_INET) antes de conectar.
 
-import socket as _socket
 import re as _re
+import socket as _socket
+import psycopg2
 
-def _to_pooler_url(url: str) -> str:
-    """
-    Transforma la URL de conexión directa de Supabase al Session Pooler IPv4.
-    Entrada:  postgresql://postgres:pass@db.PROJECTREF.supabase.co:5432/postgres
-    Salida:   postgresql://postgres.PROJECTREF:pass@aws-0-us-east-1.pooler.supabase.com:6543/postgres
-    Si la URL ya usa el pooler o no matchea el patrón, la devuelve sin cambios.
-    """
+def _parse_db_url(url: str) -> dict:
+    """Descompone la DATABASE_URL en sus partes."""
     m = _re.match(
-        r'(postgresql://)(postgres):([^@]+)@db\.([^.]+)\.supabase\.co:5432/postgres',
+        r'postgresql://([^:]+):([^@]+)@([^:/]+):?(\d+)?/(.+)',
         url
     )
     if not m:
-        return url
-    scheme, user, password, project_ref = m.group(1), m.group(2), m.group(3), m.group(4)
-    # Session Pooler URL — región us-east-1 cubre la mayoría de proyectos Supabase
-    # Si tu proyecto está en otra región, ajustá el host manualmente en DATABASE_URL
-    pooler_host = f'aws-0-us-east-1.pooler.supabase.com'
-    pooler_user = f'{user}.{project_ref}'
-    return f'{scheme}{pooler_user}:{password}@{pooler_host}:6543/postgres'
+        raise ValueError(f"DATABASE_URL con formato inválido: {url}")
+    return {
+        'user':     m.group(1),
+        'password': m.group(2),
+        'host':     m.group(3),
+        'port':     int(m.group(4) or 5432),
+        'dbname':   m.group(5).split('?')[0],
+    }
 
-_DATABASE_URL = _to_pooler_url(DATABASE_URL)
+def _make_ipv4_connection():
+    """
+    Crea una conexión psycopg2 forzando IPv4.
+    - 'host' lleva el hostname real → psycopg2/libpq lo usa como SNI en TLS
+      (Supabase necesita el SNI para identificar el tenant)
+    - 'hostaddr' lleva la IP IPv4 resuelta → libpq conecta a esa IP directamente,
+      sin hacer DNS lookup (que podría devolver IPv6)
+    Combinando ambos: conexión por IPv4 + SNI correcto = autenticación exitosa.
+    """
+    p = _parse_db_url(DATABASE_URL)
+    # Resolver forzando AF_INET para obtener la IPv4
+    ipv4 = _socket.getaddrinfo(p['host'], p['port'], _socket.AF_INET)[0][4][0]
+    conn = psycopg2.connect(
+        host=p['host'],       # hostname real → usado como SNI en TLS
+        hostaddr=ipv4,        # IP IPv4 → libpq conecta directo, sin DNS
+        port=p['port'],
+        user=p['user'],
+        password=p['password'],
+        dbname=p['dbname'],
+        sslmode='require',
+    )
+    return conn
 
 engine = create_engine(
-    _DATABASE_URL,
+    "postgresql+psycopg2://",
+    creator=_make_ipv4_connection,
     pool_size=5,
     max_overflow=10,
     pool_pre_ping=True,
     pool_recycle=300,
-    connect_args={"sslmode": "require"},
 )
 
 def row_to_dict(row):
@@ -308,14 +328,18 @@ def get_stats():
 # ── HEALTH CHECK ─────────────────────────────────────────────────────────────
 @app.route('/api/health', methods=['GET'])
 def health():
-    # Muestra la URL efectiva (sin password) para debug
-    safe_url = _re.sub(r':([^@]+)@', ':***@', _DATABASE_URL)
+    p = _parse_db_url(DATABASE_URL)
+    try:
+        ipv4 = _socket.getaddrinfo(p['host'], p['port'], _socket.AF_INET)[0][4][0]
+        resolved = f"{p['host']} → {ipv4}:{p['port']}"
+    except Exception as e:
+        resolved = f"DNS error: {e}"
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-        return jsonify({'status': 'ok', 'db': 'connected', 'url': safe_url})
+        return jsonify({'status': 'ok', 'db': 'connected', 'resolved': resolved})
     except Exception as e:
-        return jsonify({'status': 'error', 'db': str(e), 'url': safe_url}), 500
+        return jsonify({'status': 'error', 'db': str(e), 'resolved': resolved}), 500
 
 # ── SERVE FRONTEND ──────────────────────────────────────────────────────────
 HTML = """
