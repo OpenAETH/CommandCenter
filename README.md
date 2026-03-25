@@ -177,7 +177,7 @@ campaigns             strategy_logs
 
 Formato esperado de `DATABASE_URL`:
 ```
-postgresql://USER:PASSWORD@HOST:PORT/DBNAME
+postgresql://postgres.bgjjmeenermkwxqewaml:mypassword@aws-0-us-west-2.pooler.supabase.com:5432/postgres 
 ```
 
 ---
