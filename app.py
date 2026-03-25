@@ -14,12 +14,14 @@ DATABASE_URL = os.environ.get(
 )
 
 # Connection pool — reused across requests, thread-safe
+# Supabase requiere SSL — lo forzamos por código para no depender del formato de la URL
 engine = create_engine(
     DATABASE_URL,
     pool_size=5,
     max_overflow=10,
-    pool_pre_ping=True,   # verifica conexiones muertas antes de usarlas
-    pool_recycle=300,     # recicla conexiones cada 5 min (evita cortes de Supabase)
+    pool_pre_ping=True,
+    pool_recycle=300,
+    connect_args={"sslmode": "require"},
 )
 
 def row_to_dict(row):
@@ -271,6 +273,16 @@ def get_stats():
     }
     with engine.connect() as conn:
         return jsonify({k: conn.execute(text(v)).scalar() for k, v in queries.items()})
+
+# ── HEALTH CHECK ─────────────────────────────────────────────────────────────
+@app.route('/api/health', methods=['GET'])
+def health():
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return jsonify({'status': 'ok', 'db': 'connected'})
+    except Exception as e:
+        return jsonify({'status': 'error', 'db': str(e)}), 500
 
 # ── SERVE FRONTEND ──────────────────────────────────────────────────────────
 HTML = """
@@ -1113,21 +1125,23 @@ async function api(path,method='GET',body=null){
   if(body) opts.body=JSON.stringify(body);
   let r;
   try{r=await fetch(API+path,opts);}
-  catch(e){throw new Error('Sin conexión con Flask. ¿Corriste python3 app.py?');}
-  if(!r.ok){let m='Error';try{m=await r.text();}catch(e){}throw new Error(m);}
+  catch(e){throw new Error('Error de red: '+e.message);}
+  if(!r.ok){let m='Error '+r.status;try{m=await r.text();}catch(e){}throw new Error(m);}
   return r.json();
 }
 
 async function boot(){
   try{
     await Promise.all([loadContacts(),loadProducts(),loadTasks(),loadCampaigns(),loadLogs(),loadStats()]);
+    const old=document.getElementById('boot-err');if(old)old.remove();
     render();
   }catch(e){
-    console.error(e);
+    console.error('Boot error:',e);
+    const existing=document.getElementById('boot-err');if(existing)existing.remove();
     document.body.insertAdjacentHTML('afterbegin',
       `<div id="boot-err" style="position:fixed;top:0;left:0;right:0;z-index:9999;background:#ff3e5e;color:#fff;
         font-size:11px;padding:9px 20px;text-align:center;font-family:monospace;">
-        ⚠ No se puede conectar con Flask. Corré <strong>python3 app.py</strong> y abrí <strong>http://localhost:5000</strong>
+        &#9888; Error al cargar datos: ${e.message}
         <button onclick="document.getElementById('boot-err').remove();boot()" style="margin-left:12px;padding:2px 10px;
           background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.4);color:#fff;border-radius:3px;cursor:pointer;font-family:monospace">
           Reintentar
