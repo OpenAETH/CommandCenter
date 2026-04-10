@@ -7,79 +7,83 @@ import os
 import json
 import socket
 import psycopg2
-import threading
+import psycopg2.extras
 
 app = Flask(__name__)
 CORS(app)
 
-# --- CONFIGURACIÓN DE BASE DE DATOS (OPTIMIZADA) ---
-# 1. Eliminamos la lógica compleja de resolución de DNS manual.
-# 2. Usamos la URL de conexión estándar de PostgreSQL directamente con SQLAlchemy.
-# 3. El parámetro ?sslmode=require se encarga del cifrado TLS para Supabase.
 DATABASE_URL = os.environ.get(
     'DATABASE_URL',
-    'postgresql://postgres:[YOUR-PASSWORD]@db.bgjjmeenermkwxqewaml.supabase.co:5432/postgres?sslmode=require'
+    'postgresql://postgres:[YOUR-PASSWORD]@db.bgjjmeenermkwxqewaml.supabase.co:5432/postgres'
 )
 
-# Verificación simple de seguridad (para evitar exponer la URL si no se configura)
-if "[YOUR-PASSWORD]" in DATABASE_URL:
-    print("\n" + "!"*60)
-    print("  ADVERTENCIA: Estás usando la contraseña por defecto.")
-    print("  Configura la variable de entorno DATABASE_URL.")
-    print("!"*60 + "\n")
+# Connection pool — reused across requests, thread-safe
+# ── Supabase connection ───────────────────────────────────────────────────────
+# Render resuelve db.xxx.supabase.co como IPv6, pero Supabase solo acepta IPv4.
+# Solución: creador de conexiones personalizado con psycopg2 que resuelve el host
+# explícitamente como IPv4 (socket.AF_INET) antes de conectar.
 
-# --- CONFIGURACIÓN DEL ENGINE (OPTIMIZADA) ---
-# Usamos un pool más robusto y configuraciones probadas para Supabase.
+import re as _re
+import socket as _socket
+import psycopg2
+
+def _parse_db_url(url: str) -> dict:
+    """Descompone la DATABASE_URL en sus partes."""
+    m = _re.match(
+        r'postgresql://([^:]+):([^@]+)@([^:/]+):?(\d+)?/(.+)',
+        url
+    )
+    if not m:
+        raise ValueError(f"DATABASE_URL con formato inválido: {url}")
+    return {
+        'user':     m.group(1),
+        'password': m.group(2),
+        'host':     m.group(3),
+        'port':     int(m.group(4) or 5432),
+        'dbname':   m.group(5).split('?')[0],
+    }
+
+def _make_ipv4_connection():
+    """
+    Crea una conexión psycopg2 forzando IPv4.
+    - 'host' lleva el hostname real → psycopg2/libpq lo usa como SNI en TLS
+      (Supabase necesita el SNI para identificar el tenant)
+    - 'hostaddr' lleva la IP IPv4 resuelta → libpq conecta a esa IP directamente,
+      sin hacer DNS lookup (que podría devolver IPv6)
+    Combinando ambos: conexión por IPv4 + SNI correcto = autenticación exitosa.
+    """
+    p = _parse_db_url(DATABASE_URL)
+    # Resolver forzando AF_INET para obtener la IPv4
+    ipv4 = _socket.getaddrinfo(p['host'], p['port'], _socket.AF_INET)[0][4][0]
+    conn = psycopg2.connect(
+        host=p['host'],       # hostname real → usado como SNI en TLS
+        hostaddr=ipv4,        # IP IPv4 → libpq conecta directo, sin DNS
+        port=p['port'],
+        user=p['user'],
+        password=p['password'],
+        dbname=p['dbname'],
+        sslmode='require',
+    )
+    return conn
+
 engine = create_engine(
-    DATABASE_URL,
-    pool_size=8,            # Ajustado para producción
-    max_overflow=16,
-    pool_pre_ping=True,     # Verifica conexiones antes de usarlas (esencial para Supabase)
-    pool_recycle=3600,      # Recicla conexiones cada hora (buena práctica con Supabase PgBouncer)
-    echo=False              # Cambiar a True solo para debug
+    "postgresql+psycopg2://",
+    creator=_make_ipv4_connection,
+    pool_size=5,
+    max_overflow=10,
+    pool_pre_ping=True,
+    pool_recycle=300,
 )
 
-# --- ENDPOINT DE HEALTH CHECK (SIMPLIFICADO) ---
-@app.route('/api/health', methods=['GET'])
-def health():
-    """Verifica la conexión a la base de datos."""
-    try:
-        # Ejecuta una consulta simple para verificar la conexión
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        return jsonify({
-            'status': 'ok',
-            'db': 'connected',
-            'host': DATABASE_URL.split('@')[1].split('/')[0] if '@' in DATABASE_URL else 'local'
-        })
-    except Exception as e:
-        return jsonify({'status': 'error', 'db': str(e)}), 500
-
-# --- WARMUP (PRE-CALENTAMIENTO) SIN BLOQUEAR EL ARRANQUE ---
-def _warmup():
-    """Intenta abrir una conexión al iniciar para calentar el pool."""
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        print("  ✓ Pool de conexiones inicializado correctamente.")
-    except Exception as e:
-        print(f"  ✗ Error en el warmup del pool: {e}")
-        print("  (La aplicación intentará reconectarse en las siguientes peticiones)")
-
-# Iniciar el warmup en un hilo separado para no retrasar el inicio de Flask
-threading.Thread(target=_warmup, daemon=True).start()
-
-# --- FUNCIÓN AUXILIAR PARA CONVERTIR FILAS A DICCIONARIO (SIN CAMBIOS) ---
 def row_to_dict(row):
-    """Convierte una fila de SQLAlchemy a un diccionario JSON serializable."""
+    """Convierte una Row de SQLAlchemy a dict serializable."""
     d = dict(row._mapping)
     for k, v in d.items():
-        if hasattr(v, 'isoformat'):
+        if hasattr(v, 'isoformat'):   # date / datetime / timestamptz
             d[k] = v.isoformat()
     return d
 
-# --- RUTAS PARA CONTACTOS, PRODUCTOS, TASKS, CAMPAIGNS, LOGS, STATS ---
-# (Se mantienen exactamente igual que en tu código original, son correctas y eficientes)
+# ── CONTACTS ─────────────────────────────────────────────────────────────────
 @app.route('/api/contacts', methods=['GET'])
 def get_contacts():
     with engine.connect() as conn:
@@ -320,6 +324,22 @@ def get_stats():
     }
     with engine.connect() as conn:
         return jsonify({k: conn.execute(text(v)).scalar() for k, v in queries.items()})
+
+# ── HEALTH CHECK ─────────────────────────────────────────────────────────────
+@app.route('/api/health', methods=['GET'])
+def health():
+    p = _parse_db_url(DATABASE_URL)
+    try:
+        ipv4 = _socket.getaddrinfo(p['host'], p['port'], _socket.AF_INET)[0][4][0]
+        resolved = f"{p['host']} → {ipv4}:{p['port']}"
+    except Exception as e:
+        resolved = f"DNS error: {e}"
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return jsonify({'status': 'ok', 'db': 'connected', 'resolved': resolved})
+    except Exception as e:
+        return jsonify({'status': 'error', 'db': str(e), 'resolved': resolved}), 500
 
 # ── SERVE FRONTEND ──────────────────────────────────────────────────────────
 HTML = """
@@ -591,7 +611,7 @@ input,select,textarea{font-family:inherit;}
 .log-del{position:absolute;top:9px;right:9px;display:none;}
 .log-entry:hover .log-del{display:flex;}
 
-/* ══ GUÍA ══ */
+/* ══ GUÍA — layout optimizado ══ */
 .guide-body{flex:1;overflow-y:auto;padding:16px 20px;}
 .guide-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;max-width:1400px;}
 .guide-hero{grid-column:1/-1;background:var(--bg1);border:1px solid var(--border2);
@@ -846,6 +866,8 @@ input,select,textarea{font-family:inherit;}
     </div>
     <div class="guide-body">
       <div class="guide-grid">
+
+        <!-- Hero compacto con stats en vivo -->
         <div class="guide-hero">
           <div class="guide-hero-left">
             <div class="guide-hero-title">OpenAETH Command Core</div>
@@ -866,6 +888,7 @@ input,select,textarea{font-family:inherit;}
           </div>
         </div>
 
+        <!-- Flujo compacto -->
         <div class="guide-flow">
           <div class="guide-flow-title">🔗 Flujo del sistema</div>
           <div class="guide-flow-row">
@@ -883,8 +906,12 @@ input,select,textarea{font-family:inherit;}
           </div>
         </div>
 
+        <!-- CRM card -->
         <div class="guide-card">
-          <div class="guide-card-head"><div class="guide-card-icon">🧲</div><div><div class="guide-card-title" style="color:var(--cyan)">CRM</div><div class="guide-card-sub">Pipeline Kanban · 5 estados</div></div></div>
+          <div class="guide-card-head">
+            <div class="guide-card-icon">🧲</div>
+            <div><div class="guide-card-title" style="color:var(--cyan)">CRM</div><div class="guide-card-sub">Pipeline Kanban · 5 estados</div></div>
+          </div>
           <div class="guide-steps">
             <div class="guide-step"><div class="gsn hl">1</div><div><div class="gs-title">Crear contacto</div><div class="gs-desc">+ Contacto → tipo (prensa/partner/cliente), medio de origen, fecha de follow-up.</div></div></div>
             <div class="guide-step"><div class="gsn">2</div><div><div class="gs-title">Avanzar pipeline</div><div class="gs-desc">Hover card → <span class="guide-kbd">▶</span> para siguiente estado, o editá desde el modal.</div></div></div>
@@ -894,8 +921,12 @@ input,select,textarea{font-family:inherit;}
           <div class="guide-tip"><strong>Tip:</strong> Al cerrar un deal → registrá el aprendizaje como <em>Insight</em> en Estrategia.</div>
         </div>
 
+        <!-- DEV card -->
         <div class="guide-card">
-          <div class="guide-card-head"><div class="guide-card-icon">⚙️</div><div><div class="guide-card-title" style="color:var(--orange)">DEV</div><div class="guide-card-sub">Módulos · Tasks · Progreso</div></div></div>
+          <div class="guide-card-head">
+            <div class="guide-card-icon">⚙️</div>
+            <div><div class="guide-card-title" style="color:var(--orange)">DEV</div><div class="guide-card-sub">Módulos · Tasks · Progreso</div></div>
+          </div>
           <div class="guide-steps">
             <div class="guide-step"><div class="gsn hl">1</div><div><div class="gs-title">Portafolio de productos</div><div class="gs-desc">Cada producto tiene sus módulos. Convbot, Bitacora, PromptForge, TerraGazette y más.</div></div></div>
             <div class="guide-step"><div class="gsn">2</div><div><div class="gs-title">Crear / editar productos</div><div class="gs-desc">+ Producto en el header. Nombre, ícono, estado (activo/idea/pausado/archivado) y color.</div></div></div>
@@ -905,8 +936,12 @@ input,select,textarea{font-family:inherit;}
           <div class="guide-tip"><strong>Tip:</strong> Usá el estado "idea" para productos en exploración — aparecen con badge diferente sin contaminar el foco.</div>
         </div>
 
+        <!-- CAMPAÑA card -->
         <div class="guide-card">
-          <div class="guide-card-head"><div class="guide-card-icon">🚀</div><div><div class="guide-card-title" style="color:var(--purple-light)">CAMPAÑA</div><div class="guide-card-sub">Canales · Métricas · Gráficos</div></div></div>
+          <div class="guide-card-head">
+            <div class="guide-card-icon">🚀</div>
+            <div><div class="guide-card-title" style="color:var(--purple-light)">CAMPAÑA</div><div class="guide-card-sub">Canales · Métricas · Gráficos</div></div>
+          </div>
           <div class="guide-steps">
             <div class="guide-step"><div class="gsn hl">1</div><div><div class="gs-title">Crear canales</div><div class="gs-desc">+ Canal → nombre, ícono, notas. Visitas/leads/backers editables inline.</div></div></div>
             <div class="guide-step"><div class="gsn">2</div><div><div class="gs-title">Ver gráficos</div><div class="gs-desc">Leads por canal y conversión % en gráficos de barra actualizados en tiempo real.</div></div></div>
@@ -916,8 +951,12 @@ input,select,textarea{font-family:inherit;}
           <div class="guide-tip"><strong>Tip:</strong> Alta conv + pocas visitas = escalar. Muchas visitas + baja conv = mejorar el mensaje.</div>
         </div>
 
+        <!-- ESTRATEGIA card -->
         <div class="guide-card">
-          <div class="guide-card-head"><div class="guide-card-icon">🧠</div><div><div class="guide-card-title" style="color:var(--green)">ESTRATEGIA</div><div class="guide-card-sub">Decisiones · Insights · Riesgos</div></div></div>
+          <div class="guide-card-head">
+            <div class="guide-card-icon">🧠</div>
+            <div><div class="guide-card-title" style="color:var(--green)">ESTRATEGIA</div><div class="guide-card-sub">Decisiones · Insights · Riesgos</div></div>
+          </div>
           <div class="guide-steps">
             <div class="guide-step"><div class="gsn hl">1</div><div><div class="gs-title">Registrar decisiones</div><div class="gs-desc">Cada decisión no trivial → registrar. ¿Por qué? ¿Qué descartaste?</div></div></div>
             <div class="guide-step"><div class="gsn">2</div><div><div class="gs-title">Capturar insights</div><div class="gs-desc">Algo sorprendente, un cliente revelador, un canal inesperado → Insight.</div></div></div>
@@ -927,8 +966,12 @@ input,select,textarea{font-family:inherit;}
           <div class="guide-tip"><strong>Tip:</strong> Revisá semanalmente. La diferencia entre hoy y hace un mes está ahí escrita.</div>
         </div>
 
+        <!-- Shortcuts -->
         <div class="guide-shortcuts">
-          <div class="guide-card-head"><div class="guide-card-icon">⌨️</div><div><div class="guide-card-title">Atajos de teclado</div></div></div>
+          <div class="guide-card-head">
+            <div class="guide-card-icon">⌨️</div>
+            <div><div class="guide-card-title">Atajos de teclado</div></div>
+          </div>
           <div class="guide-shortcut-grid">
             <div class="gsr"><span class="gsr-label">CRM</span><span class="guide-kbd">1</span></div>
             <div class="gsr"><span class="gsr-label">DEV</span><span class="guide-kbd">2</span></div>
@@ -941,16 +984,29 @@ input,select,textarea{font-family:inherit;}
           </div>
         </div>
 
+        <!-- Rutina diaria -->
         <div class="guide-rutina">
-          <div class="guide-card-head" style="margin-bottom:10px"><div class="guide-card-icon">📅</div><div><div class="guide-card-title">Rutina diaria · 15 min</div></div></div>
-          <div class="gr-row"><div class="gr-icon" style="background:var(--cyan-dim);border:1px solid rgba(0,229,255,.2)">☀️</div><div><div class="gs-title" style="color:var(--cyan)">Mañana — CRM (5 min)</div><div class="gs-desc">Follow-ups del día, actualizar estados de conversaciones de ayer.</div></div></div>
-          <div class="gr-row"><div class="gr-icon" style="background:var(--orange-dim);border:1px solid rgba(255,107,53,.2)">⚡</div><div><div class="gs-title" style="color:var(--orange)">Mediodía — DEV (5 min)</div><div class="gs-desc">Marcar completadas, mover todo→doing. ¿Hay algo bloqueado?</div></div></div>
-          <div class="gr-row"><div class="gr-icon" style="background:var(--green-dim);border:1px solid rgba(57,255,20,.2)">🌙</div><div><div class="gs-title" style="color:var(--green)">Noche — Estrategia (5 min)</div><div class="gs-desc">¿Aprendiste algo? ¿Tomaste una decisión? Registrala antes de cerrar.</div></div></div>
+          <div class="guide-card-head" style="margin-bottom:10px">
+            <div class="guide-card-icon">📅</div>
+            <div><div class="guide-card-title">Rutina diaria · 15 min</div></div>
+          </div>
+          <div class="gr-row">
+            <div class="gr-icon" style="background:var(--cyan-dim);border:1px solid rgba(0,229,255,.2)">☀️</div>
+            <div><div class="gs-title" style="color:var(--cyan)">Mañana — CRM (5 min)</div><div class="gs-desc">Follow-ups del día, actualizar estados de conversaciones de ayer.</div></div>
+          </div>
+          <div class="gr-row">
+            <div class="gr-icon" style="background:var(--orange-dim);border:1px solid rgba(255,107,53,.2)">⚡</div>
+            <div><div class="gs-title" style="color:var(--orange)">Mediodía — DEV (5 min)</div><div class="gs-desc">Marcar completadas, mover todo→doing. ¿Hay algo bloqueado?</div></div>
+          </div>
+          <div class="gr-row">
+            <div class="gr-icon" style="background:var(--green-dim);border:1px solid rgba(57,255,20,.2)">🌙</div>
+            <div><div class="gs-title" style="color:var(--green)">Noche — Estrategia (5 min)</div><div class="gs-desc">¿Aprendiste algo? ¿Tomaste una decisión? Registrala antes de cerrar.</div></div>
+          </div>
         </div>
 
-      </div>
-    </div>
-  </div>
+      </div><!-- /guide-grid -->
+    </div><!-- /guide-body -->
+  </div><!-- /panel-guide -->
 
 </div><!-- /main -->
 </div><!-- /body-area -->
@@ -1114,13 +1170,11 @@ const CRM_COLS=[
   {key:'cerrado',label:'Cerrado',color:'#39ff14'},
 ];
 const LOG_C={Decision:'#00e5ff',Insight:'#ffd700',Riesgo:'#ff3e5e',Oportunidad:'#39ff14'};
+const MODS=['Auth','Backend','UI','Multi-IA'];
 
 // clock
 function tick(){const n=new Date();document.getElementById('clock').textContent=n.toLocaleDateString('es-AR',{weekday:'short'}).toUpperCase()+' '+n.toTimeString().slice(0,8);}
 setInterval(tick,1000);tick();
-
-// ── KEEP-ALIVE: ping cada 14 min para evitar que Render duerma el servicio ──
-setInterval(()=>fetch(API+'/api/health').catch(()=>{}), 14*60*1000);
 
 // api
 async function api(path,method='GET',body=null){
@@ -1133,41 +1187,25 @@ async function api(path,method='GET',body=null){
   return r.json();
 }
 
-// ── BOOT con retry automático (backoff: 2s, 4s, 8s) ─────────────────────────
-async function boot(attempt=1){
+async function boot(){
   try{
     await Promise.all([loadContacts(),loadProducts(),loadTasks(),loadCampaigns(),loadLogs(),loadStats()]);
     const old=document.getElementById('boot-err');if(old)old.remove();
     render();
   }catch(e){
-    console.error(`Boot error (intento ${attempt}):`,e);
-    if(attempt<4){
-      const delay=attempt*2000;
-      console.log(`Reintentando en ${delay/1000}s...`);
-      // Mostrar banner amarillo "conectando" solo a partir del 2do intento
-      if(attempt>1) showBootError(e.message,true);
-      setTimeout(()=>boot(attempt+1),delay);
-    }else{
-      showBootError(e.message,false);
-    }
+    console.error('Boot error:',e);
+    const existing=document.getElementById('boot-err');if(existing)existing.remove();
+    document.body.insertAdjacentHTML('afterbegin',
+      `<div id="boot-err" style="position:fixed;top:0;left:0;right:0;z-index:9999;background:#ff3e5e;color:#fff;
+        font-size:11px;padding:9px 20px;text-align:center;font-family:monospace;">
+        &#9888; Error al cargar datos: ${e.message}
+        <button onclick="document.getElementById('boot-err').remove();boot()" style="margin-left:12px;padding:2px 10px;
+          background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.4);color:#fff;border-radius:3px;cursor:pointer;font-family:monospace">
+          Reintentar
+        </button></div>`);
     render();
   }
 }
-
-function showBootError(msg,retrying){
-  const existing=document.getElementById('boot-err');if(existing)existing.remove();
-  document.body.insertAdjacentHTML('afterbegin',
-    `<div id="boot-err" style="position:fixed;top:0;left:0;right:0;z-index:9999;
-      background:${retrying?'#ff9f43':'#ff3e5e'};color:#fff;font-size:11px;padding:9px 20px;
-      text-align:center;font-family:monospace;">
-      ${retrying
-        ? '⟳ Conectando con el servidor...'
-        : '&#9888; Error al cargar datos: '+msg+
-          '<button onclick="document.getElementById(\'boot-err\').remove();boot()" style="margin-left:12px;padding:2px 10px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.4);color:#fff;border-radius:3px;cursor:pointer;font-family:monospace">Reintentar</button>'
-      }
-    </div>`);
-}
-// ─────────────────────────────────────────────────────────────────────────────
 
 async function loadContacts(){STATE.contacts=await api('/api/contacts');}
 async function loadProducts(){STATE.products=await api('/api/products');}
@@ -1192,13 +1230,10 @@ function switchPanel(name,btnEl){
 function renderStats(){
   const s=STATE.stats;
   const pct=s.tasks_total?Math.round(s.tasks_done/s.tasks_total*100):0;
-  const setText=(id,val)=>{const el=document.getElementById(id);if(el)el.textContent=val??'—';};
+  const setText=(id,v)=>{const el=document.getElementById(id);if(el)el.textContent=v??'—';};
   setText('ts-leads',s.contacts_active);setText('ts-doing',s.tasks_doing);setText('ts-logs',s.logs_total);
-  setText('gs-c',s.contacts_total);setText('gs-t',s.tasks_todo);
-  setText('gs-prod',(s.products_active||s.products_total||0)+' activos');
-  setText('gs-p',pct+'%');setText('gs-l',s.logs_total);
-  setText('g-sc',s.contacts_total);setText('g-st',(s.tasks_doing||0)+(s.tasks_todo||0));
-  setText('g-prod',s.products_active||s.products_total||0);setText('g-sp',pct+'%');setText('g-sl',s.logs_total);
+  setText('gs-c',s.contacts_total);setText('gs-t',s.tasks_todo);setText('gs-prod',(s.products_active||s.products_total||0)+' activos');setText('gs-p',pct+'%');setText('gs-l',s.logs_total);
+  setText('g-sc',s.contacts_total);setText('g-st',(s.tasks_doing||0)+(s.tasks_todo||0));setText('g-prod',s.products_active||s.products_total||0);setText('g-sp',pct+'%');setText('g-sl',s.logs_total);
   setText('nb-crm',s.contacts_total||0);setText('slb-crm',s.contacts_total||0);
   setText('nb-dev',s.products_total||0);setText('slb-dev',s.products_total||0);
   const devTaskEl=document.getElementById('nb-dev-tasks');
@@ -1282,7 +1317,7 @@ async function deleteContact(){
 }
 
 // ══ DEV ══
-let prodExp={};
+let prodExp={};  // {product_id: {open:bool, modules:{modName:bool}}}
 
 function expandAllProducts(){
   STATE.products.forEach(p=>{
@@ -1304,15 +1339,19 @@ function renderDev(){
     const pdone=ptasks.filter(t=>t.done).length;
     const ppct=ptasks.length?Math.round(pdone/ptasks.length*100):0;
     const clr=prod.color||'#00e5ff';
+
+    // group by module
     const modules=[...new Set(ptasks.map(t=>t.module))];
+    
     const el=document.createElement('div');
     el.className='dev-product';
     el.style.borderLeftColor=clr;
     el.style.borderLeftWidth='3px';
+
     let modHtml='';
     if(state.open){
       modules.forEach((mod,mi)=>{
-        if(state.modules[mod]===undefined) state.modules[mod]=true;
+        if(!state.modules[mod]) state.modules[mod]=true;
         const mtasks=ptasks.filter(t=>t.module===mod);
         const mdone=mtasks.filter(t=>t.done).length;
         const mpct=mtasks.length?Math.round(mdone/mtasks.length*100):0;
@@ -1332,6 +1371,7 @@ function renderDev(){
         </div>`;
       });
     }
+
     el.innerHTML=`<div class="dev-prod-head" onclick="toggleProd(${prod.id})">
         <span class="chevron ${state.open?'open':''}">▶</span>
         <span class="dev-prod-icon">${prod.icon}</span>
@@ -1368,20 +1408,25 @@ function dtHTML(t,clr='#00e5ff'){
 
 function toggleProd(pid){
   if(!prodExp[pid]) prodExp[pid]={open:false,modules:{}};
-  prodExp[pid].open=!prodExp[pid].open;renderDev();
+  prodExp[pid].open=!prodExp[pid].open;
+  renderDev();
 }
 function toggleMod(pid,mod){
   if(!prodExp[pid]) prodExp[pid]={open:true,modules:{}};
-  prodExp[pid].modules[mod]=prodExp[pid].modules[mod]===false?true:false;renderDev();
+  prodExp[pid].modules[mod]=prodExp[pid].modules[mod]===false?true:false;
+  renderDev();
 }
+
 async function toggleTask(id){
   try{await api('/api/tasks/'+id+'/toggle','PATCH');await loadTasks();await loadStats();renderDev();renderStats();}
   catch(e){toast(e.message,'error');}
 }
+
 function fillProductSelect(selectedId=null){
   const sel=document.getElementById('t-product');
   sel.innerHTML=STATE.products.map(p=>`<option value="${p.id}" ${p.id==selectedId?'selected':''}>${p.icon} ${p.name}</option>`).join('');
 }
+
 function openTaskModal(id=null,defaultProdId=null,defaultMod=null){
   document.getElementById('task-id').value='';
   ['t-name','t-desc'].forEach(i=>{const el=document.getElementById(i);if(el)el.value='';});
@@ -1423,6 +1468,8 @@ async function deleteTask(){
   try{await api('/api/tasks/'+id,'DELETE');closeModal('modal-task');await loadTasks();await loadStats();renderDev();renderStats();toast('Task eliminada','error');}
   catch(e){toast(e.message,'error');}
 }
+
+// ── PRODUCTS CRUD ──
 function openProductModal(id=null){
   document.getElementById('product-id').value='';
   ['p-name','p-desc'].forEach(i=>document.getElementById(i).value='');
@@ -1471,6 +1518,8 @@ function renderCampaign(){
     <div class="mc"><div class="mc-label">Conv. prom.</div><div class="mc-val" style="color:var(--orange)">${avgC}%</div><div class="mc-sub">leads/visitas</div></div>
     <div class="mc"><div class="mc-label">Leads</div><div class="mc-val" style="color:var(--purple-light)">${totL}</div><div class="mc-sub">acumulados</div></div>
     <div class="mc"><div class="mc-label">Backers</div><div class="mc-val" style="color:var(--green)">${totB}</div><div class="mc-sub">confirmados</div></div>`;
+
+  // cards
   const wrap=document.getElementById('camp-cards-wrap');
   wrap.innerHTML='';
   cs.forEach(c=>{
@@ -1492,6 +1541,8 @@ function renderCampaign(){
       </div>`;
     wrap.appendChild(div);
   });
+
+  // right panel - summary
   const rb=document.getElementById('camp-right-body');
   rb.innerHTML='';
   const maxL=Math.max(...cs.map(c=>c.leads),1);
@@ -1504,30 +1555,41 @@ function renderCampaign(){
       <div class="cs-stats"><span class="cs-stat">👁 <span>${c.visitas.toLocaleString()}</span></span><span class="cs-stat">🎯 <span>${c.leads}</span></span><span class="cs-stat">⭐ <span>${c.backers}</span></span></div>`;
     rb.appendChild(div);
   });
+
   renderCharts();
 }
+
 function renderCharts(){
   const cs=STATE.campaigns;if(!cs.length)return;
   const labels=cs.map(c=>c.name);
   const leadsData=cs.map(c=>c.leads);
   const convData=cs.map(c=>c.visitas?(c.leads/c.visitas*100).toFixed(1):0);
   const colors=['#00e5ff','#ff6b35','#a87fff','#39ff14','#ffd700','#ff3e5e'];
-  const chartCfg={responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},
-    scales:{x:{ticks:{color:'#4e6880',font:{size:9}},grid:{color:'rgba(30,45,61,.5)'}},
-            y:{ticks:{color:'#4e6880',font:{size:9}},grid:{color:'rgba(30,45,61,.5)'}}}};
+
+  const chartCfg={
+    responsive:true,maintainAspectRatio:false,
+    plugins:{legend:{display:false}},
+    scales:{
+      x:{ticks:{color:'#4e6880',font:{size:9}},grid:{color:'rgba(30,45,61,.5)'}},
+      y:{ticks:{color:'#4e6880',font:{size:9}},grid:{color:'rgba(30,45,61,.5)'}}
+    }
+  };
+
+  // Leads chart
   const c1=document.getElementById('chart-leads');
-  if(charts.leads)charts.leads.destroy();
-  charts.leads=new Chart(c1,{type:'bar',data:{labels,datasets:[{data:leadsData,
-    backgroundColor:colors.slice(0,labels.length).map(c=>c+'88'),
-    borderColor:colors.slice(0,labels.length),borderWidth:1,borderRadius:3}]},options:chartCfg});
+  if(charts.leads){charts.leads.destroy();}
+  charts.leads=new Chart(c1,{type:'bar',data:{
+    labels,datasets:[{data:leadsData,backgroundColor:colors.slice(0,labels.length).map(c=>c+'88'),borderColor:colors.slice(0,labels.length),borderWidth:1,borderRadius:3}]
+  },options:{...chartCfg,plugins:{...chartCfg.plugins}}});
+
+  // Conv chart
   const c2=document.getElementById('chart-conv');
-  if(charts.conv)charts.conv.destroy();
-  charts.conv=new Chart(c2,{type:'bar',data:{labels,datasets:[{data:convData,
-    backgroundColor:colors.slice(0,labels.length).map(c=>c+'66'),
-    borderColor:colors.slice(0,labels.length),borderWidth:1,borderRadius:3}]},
-    options:{...chartCfg,scales:{...chartCfg.scales,y:{...chartCfg.scales.y,
-      ticks:{...chartCfg.scales.y.ticks,callback:val=>val+'%'}}}}});
+  if(charts.conv){charts.conv.destroy();}
+  charts.conv=new Chart(c2,{type:'bar',data:{
+    labels,datasets:[{data:convData,backgroundColor:colors.slice(0,labels.length).map(c=>c+'66'),borderColor:colors.slice(0,labels.length),borderWidth:1,borderRadius:3}]
+  },options:{...chartCfg,scales:{...chartCfg.scales,y:{...chartCfg.scales.y,ticks:{...chartCfg.scales.y.ticks,callback:v=>v+'%'}}}}});
 }
+
 function uCF(id,field,val){if(!campDirty[id])campDirty[id]={};campDirty[id][field]=field==='notes'?val:(parseFloat(val)||0);}
 async function saveCampRow(id){
   const c=STATE.campaigns.find(x=>x.id===id);if(!c)return;
@@ -1575,8 +1637,7 @@ function openLogModal(){
 async function saveLog(){
   const text=document.getElementById('l-text').value.trim();if(!text){shake('l-text');return;}
   const links=v('l-links').split(',').map(s=>s.trim()).filter(Boolean);
-  try{await api('/api/logs','POST',{type:v('l-type'),title:v('l-title'),text,links,date:v('l-date')});
-    closeModal('modal-log');await loadLogs();await loadStats();renderStrategy();renderStats();toast('Log registrado','success');}
+  try{await api('/api/logs','POST',{type:v('l-type'),title:v('l-title'),text,links,date:v('l-date')});closeModal('modal-log');await loadLogs();await loadStats();renderStrategy();renderStats();toast('Log registrado','success');}
   catch(e){toast(e.message,'error');}
 }
 async function deleteLog(id){
@@ -1610,7 +1671,6 @@ document.addEventListener('keydown',e=>{
   const map={'1':'crm','2':'dev','3':'campaign','4':'strategy','5':'guide'};
   if(map[e.key])switchPanel(map[e.key]);
 });
-
 boot();
 </script>
 </body>
