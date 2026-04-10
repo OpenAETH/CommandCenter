@@ -7,79 +7,79 @@ import os
 import json
 import socket
 import psycopg2
-import psycopg2.extras
 import threading
 
 app = Flask(__name__)
 CORS(app)
 
+# --- CONFIGURACIÓN DE BASE DE DATOS (OPTIMIZADA) ---
+# 1. Eliminamos la lógica compleja de resolución de DNS manual.
+# 2. Usamos la URL de conexión estándar de PostgreSQL directamente con SQLAlchemy.
+# 3. El parámetro ?sslmode=require se encarga del cifrado TLS para Supabase.
 DATABASE_URL = os.environ.get(
     'DATABASE_URL',
-    'postgresql://postgres:[YOUR-PASSWORD]@db.bgjjmeenermkwxqewaml.supabase.co:5432/postgres'
+    'postgresql://postgres:[YOUR-PASSWORD]@db.bgjjmeenermkwxqewaml.supabase.co:5432/postgres?sslmode=require'
 )
 
-import re as _re
-import socket as _socket
-import psycopg2
+# Verificación simple de seguridad (para evitar exponer la URL si no se configura)
+if "[YOUR-PASSWORD]" in DATABASE_URL:
+    print("\n" + "!"*60)
+    print("  ADVERTENCIA: Estás usando la contraseña por defecto.")
+    print("  Configura la variable de entorno DATABASE_URL.")
+    print("!"*60 + "\n")
 
-def _parse_db_url(url: str) -> dict:
-    m = _re.match(
-        r'postgresql://([^:]+):([^@]+)@([^:/]+):?(\d+)?/(.+)',
-        url
-    )
-    if not m:
-        raise ValueError(f"DATABASE_URL con formato inválido: {url}")
-    return {
-        'user':     m.group(1),
-        'password': m.group(2),
-        'host':     m.group(3),
-        'port':     int(m.group(4) or 5432),
-        'dbname':   m.group(5).split('?')[0],
-    }
-
-def _make_ipv4_connection():
-    p = _parse_db_url(DATABASE_URL)
-    ipv4 = _socket.getaddrinfo(p['host'], p['port'], _socket.AF_INET)[0][4][0]
-    conn = psycopg2.connect(
-        host=p['host'],
-        hostaddr=ipv4,
-        port=p['port'],
-        user=p['user'],
-        password=p['password'],
-        dbname=p['dbname'],
-        sslmode='require',
-    )
-    return conn
-
+# --- CONFIGURACIÓN DEL ENGINE (OPTIMIZADA) ---
+# Usamos un pool más robusto y configuraciones probadas para Supabase.
 engine = create_engine(
-    "postgresql+psycopg2://",
-    creator=_make_ipv4_connection,
-    pool_size=5,
-    max_overflow=10,
-    pool_pre_ping=True,
-    pool_recycle=300,
+    DATABASE_URL,
+    pool_size=8,            # Ajustado para producción
+    max_overflow=16,
+    pool_pre_ping=True,     # Verifica conexiones antes de usarlas (esencial para Supabase)
+    pool_recycle=3600,      # Recicla conexiones cada hora (buena práctica con Supabase PgBouncer)
+    echo=False              # Cambiar a True solo para debug
 )
 
-# ── PRE-CALENTAR el pool al arrancar ─────────────────────────────────────────
+# --- ENDPOINT DE HEALTH CHECK (SIMPLIFICADO) ---
+@app.route('/api/health', methods=['GET'])
+def health():
+    """Verifica la conexión a la base de datos."""
+    try:
+        # Ejecuta una consulta simple para verificar la conexión
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return jsonify({
+            'status': 'ok',
+            'db': 'connected',
+            'host': DATABASE_URL.split('@')[1].split('/')[0] if '@' in DATABASE_URL else 'local'
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'db': str(e)}), 500
+
+# --- WARMUP (PRE-CALENTAMIENTO) SIN BLOQUEAR EL ARRANQUE ---
 def _warmup():
+    """Intenta abrir una conexión al iniciar para calentar el pool."""
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-        print("  ✓ DB pool warmup completado")
+        print("  ✓ Pool de conexiones inicializado correctamente.")
     except Exception as e:
-        print(f"  ✗ DB warmup error: {e}")
+        print(f"  ✗ Error en el warmup del pool: {e}")
+        print("  (La aplicación intentará reconectarse en las siguientes peticiones)")
 
+# Iniciar el warmup en un hilo separado para no retrasar el inicio de Flask
 threading.Thread(target=_warmup, daemon=True).start()
-# ─────────────────────────────────────────────────────────────────────────────
 
+# --- FUNCIÓN AUXILIAR PARA CONVERTIR FILAS A DICCIONARIO (SIN CAMBIOS) ---
 def row_to_dict(row):
+    """Convierte una fila de SQLAlchemy a un diccionario JSON serializable."""
     d = dict(row._mapping)
     for k, v in d.items():
         if hasattr(v, 'isoformat'):
             d[k] = v.isoformat()
     return d
 
-# ── CONTACTS ─────────────────────────────────────────────────────────────────
+# --- RUTAS PARA CONTACTOS, PRODUCTOS, TASKS, CAMPAIGNS, LOGS, STATS ---
+# (Se mantienen exactamente igual que en tu código original, son correctas y eficientes)
 @app.route('/api/contacts', methods=['GET'])
 def get_contacts():
     with engine.connect() as conn:
@@ -320,22 +320,6 @@ def get_stats():
     }
     with engine.connect() as conn:
         return jsonify({k: conn.execute(text(v)).scalar() for k, v in queries.items()})
-
-# ── HEALTH CHECK ─────────────────────────────────────────────────────────────
-@app.route('/api/health', methods=['GET'])
-def health():
-    p = _parse_db_url(DATABASE_URL)
-    try:
-        ipv4 = _socket.getaddrinfo(p['host'], p['port'], _socket.AF_INET)[0][4][0]
-        resolved = f"{p['host']} → {ipv4}:{p['port']}"
-    except Exception as e:
-        resolved = f"DNS error: {e}"
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        return jsonify({'status': 'ok', 'db': 'connected', 'resolved': resolved})
-    except Exception as e:
-        return jsonify({'status': 'error', 'db': str(e), 'resolved': resolved}), 500
 
 # ── SERVE FRONTEND ──────────────────────────────────────────────────────────
 HTML = """
