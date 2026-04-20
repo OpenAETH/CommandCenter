@@ -11,3 +11,5 @@ services:
         sync: false
       - key: MONGODB_DB
         sync: false
+      - key: GROQ_API_KEY
+        sync: false

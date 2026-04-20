@@ -4,8 +4,12 @@ from pymongo import MongoClient
 from pymongo.server_api import ServerApi
 from bson import ObjectId
 from datetime import datetime
-import os
-import certifi
+import os, json, certifi
+
+try:
+    from groq import Groq as GroqClient
+except ImportError:
+    GroqClient = None
 
 app = Flask(__name__)
 CORS(app)
@@ -16,6 +20,7 @@ CORS(app)
 
 MONGODB_URI = os.environ.get('MONGODB_URI', '')
 MONGODB_DB  = os.environ.get('MONGODB_DB', 'commandcenter')
+GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
 
 client = MongoClient(
     MONGODB_URI,
@@ -26,12 +31,13 @@ client = MongoClient(
 )
 db = client[MONGODB_DB]
 
+groq_client = GroqClient(api_key=GROQ_API_KEY) if (GroqClient and GROQ_API_KEY) else None
+
 # ============================================================================
 # HELPERS
 # ============================================================================
 
 def doc(d):
-    """Convert a MongoDB document to a JSON-serializable dict with 'id' field."""
     if d is None:
         return None
     d = dict(d)
@@ -45,7 +51,7 @@ def oid(s):
     return ObjectId(s)
 
 # ============================================================================
-# HEALTH CHECK
+# HEALTH
 # ============================================================================
 
 @app.route('/api/health', methods=['GET'])
@@ -53,25 +59,23 @@ def health():
     try:
         client.admin.command('ping')
         return jsonify({
-            'status': 'ok',
-            'db': 'connected',
+            'status': 'ok', 'db': 'connected',
             'mongo_db': MONGODB_DB,
+            'groq': bool(groq_client),
             'timestamp': datetime.now().isoformat()
         })
     except Exception as e:
         return jsonify({'status': 'error', 'db': str(e)}), 500
 
 # ============================================================================
-# ENDPOINTS CRM
+# CRM — CONTACTS
 # ============================================================================
 
 @app.route('/api/contacts', methods=['GET'])
 def get_contacts():
     try:
-        rows = list(db.contacts.find().sort('updated_at', -1))
-        return jsonify([doc(r) for r in rows])
+        return jsonify([doc(r) for r in db.contacts.find().sort('updated_at', -1)])
     except Exception as e:
-        print(f"Error in get_contacts: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/contacts', methods=['POST'])
@@ -80,24 +84,17 @@ def create_contact():
     try:
         now = datetime.utcnow()
         contact = {
-            'name':         d.get('name', ''),
-            'medio':        d.get('medio', ''),
-            'empresa':      d.get('empresa', ''),
-            'tipo':         d.get('tipo', 'prensa'),
-            'status':       d.get('status', 'nuevo'),
-            'email':        d.get('email', ''),
-            'telefono':     d.get('telefono', ''),
-            'last_contact': d.get('last_contact', ''),
-            'next_followup':d.get('next_followup', ''),
-            'notes':        d.get('notes', ''),
-            'created_at':   now,
-            'updated_at':   now,
+            'name': d.get('name', ''), 'medio': d.get('medio', ''),
+            'empresa': d.get('empresa', ''), 'tipo': d.get('tipo', 'prensa'),
+            'status': d.get('status', 'nuevo'), 'email': d.get('email', ''),
+            'telefono': d.get('telefono', ''), 'last_contact': d.get('last_contact', ''),
+            'next_followup': d.get('next_followup', ''), 'notes': d.get('notes', ''),
+            'created_at': now, 'updated_at': now,
         }
         result = db.contacts.insert_one(contact)
         contact['_id'] = result.inserted_id
         return jsonify(doc(contact)), 201
     except Exception as e:
-        print(f"Error in create_contact: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/contacts/<string:cid>', methods=['PUT'])
@@ -105,26 +102,19 @@ def update_contact(cid):
     d = request.json
     try:
         update = {
-            'name':         d.get('name', ''),
-            'medio':        d.get('medio', ''),
-            'empresa':      d.get('empresa', ''),
-            'tipo':         d.get('tipo', 'prensa'),
-            'status':       d.get('status', 'nuevo'),
-            'email':        d.get('email', ''),
-            'telefono':     d.get('telefono', ''),
-            'last_contact': d.get('last_contact', ''),
-            'next_followup':d.get('next_followup', ''),
-            'notes':        d.get('notes', ''),
-            'updated_at':   datetime.utcnow(),
+            'name': d.get('name', ''), 'medio': d.get('medio', ''),
+            'empresa': d.get('empresa', ''), 'tipo': d.get('tipo', 'prensa'),
+            'status': d.get('status', 'nuevo'), 'email': d.get('email', ''),
+            'telefono': d.get('telefono', ''), 'last_contact': d.get('last_contact', ''),
+            'next_followup': d.get('next_followup', ''), 'notes': d.get('notes', ''),
+            'updated_at': datetime.utcnow(),
         }
         result = db.contacts.find_one_and_update(
-            {'_id': oid(cid)}, {'$set': update}, return_document=True
-        )
+            {'_id': oid(cid)}, {'$set': update}, return_document=True)
         if not result:
             return jsonify({'error': 'Contact not found'}), 404
         return jsonify(doc(result))
     except Exception as e:
-        print(f"Error in update_contact: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/contacts/<string:cid>', methods=['DELETE'])
@@ -133,7 +123,6 @@ def delete_contact(cid):
         db.contacts.delete_one({'_id': oid(cid)})
         return jsonify({'ok': True})
     except Exception as e:
-        print(f"Error in delete_contact: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/contacts/<string:cid>/status', methods=['PATCH'])
@@ -143,26 +132,22 @@ def patch_contact_status(cid):
         result = db.contacts.find_one_and_update(
             {'_id': oid(cid)},
             {'$set': {'status': d['status'], 'updated_at': datetime.utcnow()}},
-            return_document=True
-        )
+            return_document=True)
         if not result:
             return jsonify({'error': 'Contact not found'}), 404
         return jsonify(doc(result))
     except Exception as e:
-        print(f"Error in patch_contact_status: {e}")
         return jsonify({'error': str(e)}), 500
 
 # ============================================================================
-# ENDPOINTS PRODUCTS
+# PRODUCTS
 # ============================================================================
 
 @app.route('/api/products', methods=['GET'])
 def get_products():
     try:
-        rows = list(db.products.find().sort([('sort_order', 1), ('_id', 1)]))
-        return jsonify([doc(r) for r in rows])
+        return jsonify([doc(r) for r in db.products.find().sort([('sort_order', 1), ('_id', 1)])])
     except Exception as e:
-        print(f"Error in get_products: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/products', methods=['POST'])
@@ -170,22 +155,17 @@ def create_product():
     d = request.json
     try:
         now = datetime.utcnow()
-        max_order = db.products.count_documents({}) + 1
         product = {
-            'name':        d.get('name'),
-            'icon':        d.get('icon', '\U0001f4e6'),
-            'description': d.get('description', ''),
-            'status':      d.get('status', 'activo'),
-            'color':       d.get('color', '#00e5ff'),
-            'sort_order':  max_order,
-            'created_at':  now,
-            'updated_at':  now,
+            'name': d.get('name'), 'icon': d.get('icon', '📦'),
+            'description': d.get('description', ''), 'status': d.get('status', 'activo'),
+            'color': d.get('color', '#00e5ff'),
+            'sort_order': db.products.count_documents({}) + 1,
+            'created_at': now, 'updated_at': now,
         }
         result = db.products.insert_one(product)
         product['_id'] = result.inserted_id
         return jsonify(doc(product)), 201
     except Exception as e:
-        print(f"Error in create_product: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/products/<string:pid>', methods=['PUT'])
@@ -193,45 +173,36 @@ def update_product(pid):
     d = request.json
     try:
         update = {
-            'name':        d.get('name'),
-            'icon':        d.get('icon', '\U0001f4e6'),
-            'description': d.get('description', ''),
-            'status':      d.get('status', 'activo'),
-            'color':       d.get('color', '#00e5ff'),
-            'updated_at':  datetime.utcnow(),
+            'name': d.get('name'), 'icon': d.get('icon', '📦'),
+            'description': d.get('description', ''), 'status': d.get('status', 'activo'),
+            'color': d.get('color', '#00e5ff'), 'updated_at': datetime.utcnow(),
         }
         result = db.products.find_one_and_update(
-            {'_id': oid(pid)}, {'$set': update}, return_document=True
-        )
+            {'_id': oid(pid)}, {'$set': update}, return_document=True)
         if not result:
             return jsonify({'error': 'Product not found'}), 404
         return jsonify(doc(result))
     except Exception as e:
-        print(f"Error in update_product: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/products/<string:pid>', methods=['DELETE'])
 def delete_product(pid):
     try:
-        # Delete all tasks belonging to this product first
         db.tasks.delete_many({'product_id': pid})
         db.products.delete_one({'_id': oid(pid)})
         return jsonify({'ok': True})
     except Exception as e:
-        print(f"Error in delete_product: {e}")
         return jsonify({'error': str(e)}), 500
 
 # ============================================================================
-# ENDPOINTS TASKS
+# TASKS
 # ============================================================================
 
 @app.route('/api/tasks', methods=['GET'])
 def get_tasks():
     try:
-        rows = list(db.tasks.find().sort([('product_id', 1), ('module', 1), ('_id', 1)]))
-        return jsonify([doc(r) for r in rows])
+        return jsonify([doc(r) for r in db.tasks.find().sort([('product_id', 1), ('module', 1), ('_id', 1)])])
     except Exception as e:
-        print(f"Error in get_tasks: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/tasks', methods=['POST'])
@@ -239,24 +210,19 @@ def create_task():
     d = request.json
     try:
         now = datetime.utcnow()
-        done = 1 if d.get('status') == 'done' else 0
         task = {
-            'product_id':  d.get('product_id'),   # stored as string ObjectId
-            'module':      d.get('module', 'Backend'),
-            'name':        d.get('name'),
-            'description': d.get('description', ''),
-            'status':      d.get('status', 'todo'),
-            'priority':    d.get('priority', 'medio'),
-            'impact':      d.get('impact', 'medio'),
-            'done':        done,
-            'created_at':  now,
-            'updated_at':  now,
+            'product_id': d.get('product_id'),
+            'module': d.get('module', 'Backend'),
+            'name': d.get('name'), 'description': d.get('description', ''),
+            'status': d.get('status', 'todo'), 'priority': d.get('priority', 'medio'),
+            'impact': d.get('impact', 'medio'),
+            'done': 1 if d.get('status') == 'done' else 0,
+            'created_at': now, 'updated_at': now,
         }
         result = db.tasks.insert_one(task)
         task['_id'] = result.inserted_id
         return jsonify(doc(task)), 201
     except Exception as e:
-        print(f"Error in create_task: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/tasks/<string:tid>', methods=['PUT'])
@@ -265,24 +231,18 @@ def update_task(tid):
     try:
         done = 1 if (d.get('done') or d.get('status') == 'done') else 0
         update = {
-            'product_id':  d.get('product_id'),
-            'module':      d.get('module', 'Backend'),
-            'name':        d.get('name'),
-            'description': d.get('description', ''),
-            'status':      d.get('status', 'todo'),
-            'priority':    d.get('priority', 'medio'),
-            'impact':      d.get('impact', 'medio'),
-            'done':        done,
-            'updated_at':  datetime.utcnow(),
+            'product_id': d.get('product_id'), 'module': d.get('module', 'Backend'),
+            'name': d.get('name'), 'description': d.get('description', ''),
+            'status': d.get('status', 'todo'), 'priority': d.get('priority', 'medio'),
+            'impact': d.get('impact', 'medio'), 'done': done,
+            'updated_at': datetime.utcnow(),
         }
         result = db.tasks.find_one_and_update(
-            {'_id': oid(tid)}, {'$set': update}, return_document=True
-        )
+            {'_id': oid(tid)}, {'$set': update}, return_document=True)
         if not result:
             return jsonify({'error': 'Task not found'}), 404
         return jsonify(doc(result))
     except Exception as e:
-        print(f"Error in update_task: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/tasks/<string:tid>/toggle', methods=['PATCH'])
@@ -296,11 +256,9 @@ def toggle_task(tid):
         result = db.tasks.find_one_and_update(
             {'_id': oid(tid)},
             {'$set': {'done': new_done, 'status': new_status, 'updated_at': datetime.utcnow()}},
-            return_document=True
-        )
+            return_document=True)
         return jsonify(doc(result))
     except Exception as e:
-        print(f"Error in toggle_task: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/tasks/<string:tid>', methods=['DELETE'])
@@ -309,20 +267,17 @@ def delete_task(tid):
         db.tasks.delete_one({'_id': oid(tid)})
         return jsonify({'ok': True})
     except Exception as e:
-        print(f"Error in delete_task: {e}")
         return jsonify({'error': str(e)}), 500
 
 # ============================================================================
-# ENDPOINTS CAMPAIGNS
+# CAMPAIGNS
 # ============================================================================
 
 @app.route('/api/campaigns', methods=['GET'])
 def get_campaigns():
     try:
-        rows = list(db.campaigns.find().sort('_id', 1))
-        return jsonify([doc(r) for r in rows])
+        return jsonify([doc(r) for r in db.campaigns.find().sort('_id', 1)])
     except Exception as e:
-        print(f"Error in get_campaigns: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/campaigns', methods=['POST'])
@@ -331,21 +286,15 @@ def create_campaign():
     try:
         now = datetime.utcnow()
         campaign = {
-            'name':       d.get('name'),
-            'icon':       d.get('icon', '\U0001f4ca'),
-            'visitas':    d.get('visitas', 0),
-            'conversion': d.get('conversion', 0),
-            'leads':      d.get('leads', 0),
-            'backers':    d.get('backers', 0),
-            'notes':      d.get('notes', ''),
-            'created_at': now,
-            'updated_at': now,
+            'name': d.get('name'), 'icon': d.get('icon', '📊'),
+            'visitas': d.get('visitas', 0), 'conversion': d.get('conversion', 0),
+            'leads': d.get('leads', 0), 'backers': d.get('backers', 0),
+            'notes': d.get('notes', ''), 'created_at': now, 'updated_at': now,
         }
         result = db.campaigns.insert_one(campaign)
         campaign['_id'] = result.inserted_id
         return jsonify(doc(campaign)), 201
     except Exception as e:
-        print(f"Error in create_campaign: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/campaigns/<string:cid>', methods=['PUT'])
@@ -353,23 +302,17 @@ def update_campaign(cid):
     d = request.json
     try:
         update = {
-            'name':       d.get('name'),
-            'icon':       d.get('icon', '\U0001f4ca'),
-            'visitas':    d.get('visitas', 0),
-            'conversion': d.get('conversion', 0),
-            'leads':      d.get('leads', 0),
-            'backers':    d.get('backers', 0),
-            'notes':      d.get('notes', ''),
-            'updated_at': datetime.utcnow(),
+            'name': d.get('name'), 'icon': d.get('icon', '📊'),
+            'visitas': d.get('visitas', 0), 'conversion': d.get('conversion', 0),
+            'leads': d.get('leads', 0), 'backers': d.get('backers', 0),
+            'notes': d.get('notes', ''), 'updated_at': datetime.utcnow(),
         }
         result = db.campaigns.find_one_and_update(
-            {'_id': oid(cid)}, {'$set': update}, return_document=True
-        )
+            {'_id': oid(cid)}, {'$set': update}, return_document=True)
         if not result:
             return jsonify({'error': 'Campaign not found'}), 404
         return jsonify(doc(result))
     except Exception as e:
-        print(f"Error in update_campaign: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/campaigns/<string:cid>', methods=['DELETE'])
@@ -378,26 +321,23 @@ def delete_campaign(cid):
         db.campaigns.delete_one({'_id': oid(cid)})
         return jsonify({'ok': True})
     except Exception as e:
-        print(f"Error in delete_campaign: {e}")
         return jsonify({'error': str(e)}), 500
 
 # ============================================================================
-# ENDPOINTS STRATEGY LOGS
+# STRATEGY LOGS
 # ============================================================================
 
 @app.route('/api/logs', methods=['GET'])
 def get_logs():
     try:
-        rows = list(db.strategy_logs.find().sort('created_at', -1))
         result = []
-        for r in rows:
+        for r in db.strategy_logs.find().sort('created_at', -1):
             d = doc(r)
             if not isinstance(d.get('links'), list):
                 d['links'] = []
             result.append(d)
         return jsonify(result)
     except Exception as e:
-        print(f"Error in get_logs: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/logs', methods=['POST'])
@@ -406,18 +346,15 @@ def create_log():
     try:
         now = datetime.utcnow()
         log = {
-            'type':       d.get('type', 'Insight'),
-            'title':      d.get('title', ''),
-            'text':       d.get('text'),
-            'links':      d.get('links', []),   # stored as native array
-            'date':       d.get('date', datetime.now().strftime('%Y-%m-%d')),
+            'type': d.get('type', 'Insight'), 'title': d.get('title', ''),
+            'text': d.get('text'), 'links': d.get('links', []),
+            'date': d.get('date', datetime.now().strftime('%Y-%m-%d')),
             'created_at': now,
         }
         result = db.strategy_logs.insert_one(log)
         log['_id'] = result.inserted_id
         return jsonify(doc(log)), 201
     except Exception as e:
-        print(f"Error in create_log: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/logs/<string:lid>', methods=['DELETE'])
@@ -426,7 +363,6 @@ def delete_log(lid):
         db.strategy_logs.delete_one({'_id': oid(lid)})
         return jsonify({'ok': True})
     except Exception as e:
-        print(f"Error in delete_log: {e}")
         return jsonify({'error': str(e)}), 500
 
 # ============================================================================
@@ -436,24 +372,246 @@ def delete_log(lid):
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
     try:
+        tasks_total = db.tasks.count_documents({})
+        tasks_done_n = db.tasks.count_documents({'done': 1})
         return jsonify({
-            'contacts_total':   db.contacts.count_documents({}),
-            'contacts_active':  db.contacts.count_documents({'status': {'$ne': 'cerrado'}}),
-            'tasks_doing':      db.tasks.count_documents({'status': 'doing'}),
-            'tasks_todo':       db.tasks.count_documents({'status': 'todo'}),
-            'tasks_done':       db.tasks.count_documents({'done': 1}),
-            'tasks_total':      db.tasks.count_documents({}),
-            'insights':         db.strategy_logs.count_documents({'type': 'Insight'}),
-            'logs_total':       db.strategy_logs.count_documents({}),
-            'products_total':   db.products.count_documents({}),
-            'products_active':  db.products.count_documents({'status': 'activo'}),
+            'contacts_total':  db.contacts.count_documents({}),
+            'contacts_active': db.contacts.count_documents({'status': {'$ne': 'cerrado'}}),
+            'tasks_doing':     db.tasks.count_documents({'status': 'doing'}),
+            'tasks_todo':      db.tasks.count_documents({'status': 'todo'}),
+            'tasks_done':      tasks_done_n,
+            'tasks_total':     tasks_total,
+            'insights':        db.strategy_logs.count_documents({'type': 'Insight'}),
+            'logs_total':      db.strategy_logs.count_documents({}),
+            'products_total':  db.products.count_documents({}),
+            'products_active': db.products.count_documents({'status': 'activo'}),
         })
     except Exception as e:
-        print(f"Error in get_stats: {e}")
         return jsonify({'error': str(e)}), 500
 
 # ============================================================================
-# FRONTEND HTML
+# GROQ CHATBOT — tool definitions
+# ============================================================================
+
+GROQ_TOOLS = [
+    {"type": "function", "function": {
+        "name": "list_products",
+        "description": "Lista todos los productos existentes en el sistema DEV.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    }},
+    {"type": "function", "function": {
+        "name": "find_product_by_name",
+        "description": "Busca un producto por nombre (parcial, case-insensitive). Usá esto antes de crear tasks para obtener el product_id.",
+        "parameters": {
+            "type": "object",
+            "properties": {"name": {"type": "string", "description": "Nombre parcial del producto"}},
+            "required": ["name"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "create_product",
+        "description": "Crea un nuevo producto en el sistema DEV.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name":        {"type": "string"},
+                "icon":        {"type": "string", "description": "Emoji, ej: 🚀"},
+                "description": {"type": "string"},
+                "status":      {"type": "string", "enum": ["activo", "idea", "pausado", "archivado"]},
+                "color":       {"type": "string", "description": "Hex color, ej: #00e5ff"},
+            },
+            "required": ["name"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "create_task",
+        "description": "Crea una tarea para un producto. Siempre buscá el product_id primero con find_product_by_name o list_products.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "product_id":  {"type": "string", "description": "ID MongoDB del producto (ObjectId string)"},
+                "module":      {"type": "string", "description": "Módulo: Backend, UI, Auth, etc. Default: General"},
+                "name":        {"type": "string"},
+                "description": {"type": "string"},
+                "status":      {"type": "string", "enum": ["todo", "doing", "done"]},
+                "priority":    {"type": "string", "enum": ["alto", "medio", "bajo"]},
+                "impact":      {"type": "string", "enum": ["alto", "medio", "bajo"]},
+            },
+            "required": ["product_id", "name"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "list_tasks",
+        "description": "Lista las tareas, opcionalmente filtradas por producto.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "product_id": {"type": "string", "description": "Filtrar por product_id (opcional)"},
+            },
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "update_task",
+        "description": "Actualiza una tarea existente.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id":     {"type": "string"},
+                "name":        {"type": "string"},
+                "description": {"type": "string"},
+                "status":      {"type": "string", "enum": ["todo", "doing", "done"]},
+                "priority":    {"type": "string", "enum": ["alto", "medio", "bajo"]},
+                "impact":      {"type": "string", "enum": ["alto", "medio", "bajo"]},
+                "module":      {"type": "string"},
+            },
+            "required": ["task_id"],
+        },
+    }},
+]
+
+def execute_tool(name, args):
+    """Execute a Groq tool call and return JSON-serializable result."""
+    try:
+        if name == "list_products":
+            products = list(db.products.find().sort('sort_order', 1))
+            return [{"id": str(p["_id"]), "name": p["name"], "status": p.get("status")} for p in products]
+
+        elif name == "find_product_by_name":
+            q = args.get("name", "")
+            products = list(db.products.find({"name": {"$regex": q, "$options": "i"}}))
+            if not products:
+                return {"found": False, "message": f"No se encontró ningún producto con nombre '{q}'"}
+            return [{"id": str(p["_id"]), "name": p["name"]} for p in products]
+
+        elif name == "create_product":
+            now = datetime.utcnow()
+            product = {
+                "name": args.get("name"), "icon": args.get("icon", "📦"),
+                "description": args.get("description", ""),
+                "status": args.get("status", "activo"),
+                "color": args.get("color", "#00e5ff"),
+                "sort_order": db.products.count_documents({}) + 1,
+                "created_at": now, "updated_at": now,
+            }
+            result = db.products.insert_one(product)
+            return {"id": str(result.inserted_id), "name": product["name"], "created": True}
+
+        elif name == "create_task":
+            now = datetime.utcnow()
+            task = {
+                "product_id": args.get("product_id"),
+                "module": args.get("module", "General"),
+                "name": args.get("name"),
+                "description": args.get("description", ""),
+                "status": args.get("status", "todo"),
+                "priority": args.get("priority", "medio"),
+                "impact": args.get("impact", "medio"),
+                "done": 0, "created_at": now, "updated_at": now,
+            }
+            result = db.tasks.insert_one(task)
+            return {"id": str(result.inserted_id), "name": task["name"], "created": True}
+
+        elif name == "list_tasks":
+            query = {}
+            if args.get("product_id"):
+                query["product_id"] = args["product_id"]
+            tasks = list(db.tasks.find(query).limit(50))
+            return [{"id": str(t["_id"]), "name": t["name"],
+                     "status": t.get("status"), "product_id": t.get("product_id")} for t in tasks]
+
+        elif name == "update_task":
+            task_id = args.pop("task_id")
+            update = {k: v for k, v in args.items() if v is not None}
+            if update.get("status") == "done":
+                update["done"] = 1
+            update["updated_at"] = datetime.utcnow()
+            result = db.tasks.find_one_and_update(
+                {"_id": ObjectId(task_id)}, {"$set": update}, return_document=True)
+            return {"updated": True, "name": result.get("name") if result else None}
+
+        return {"error": f"Herramienta desconocida: {name}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.route('/api/chat', methods=['POST'])
+def chat():
+    if not groq_client:
+        msg = 'Chatbot no disponible: ' + ('configurá GROQ_API_KEY.' if GroqClient else 'instalá la librería groq.')
+        return jsonify({'response': msg, 'refresh': False})
+
+    data = request.json or {}
+    messages = data.get('messages', [])
+
+    system_msg = {
+        "role": "system",
+        "content": (
+            "Sos el asistente IA del sistema OpenAETH CommandCenter. "
+            "Tu especialidad es gestionar el módulo DEV: productos y tareas. "
+            "Respondé siempre en español, sé conciso. "
+            "Cuando el usuario pida crear o buscar cosas, usá las herramientas disponibles. "
+            "Si el usuario menciona un producto por nombre, buscalo primero con find_product_by_name. "
+            "Confirmá siempre las acciones realizadas con un resumen claro."
+        )
+    }
+
+    all_messages = [system_msg] + [
+        {"role": m["role"], "content": m["content"]}
+        for m in messages
+        if m.get("role") in ("user", "assistant") and m.get("content")
+    ]
+
+    did_tool_calls = False
+
+    for _ in range(10):   # max 10 tool-call rounds
+        try:
+            response = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=all_messages,
+                tools=GROQ_TOOLS,
+                tool_choice="auto",
+                max_tokens=1024,
+            )
+        except Exception as e:
+            return jsonify({'response': f'Error Groq: {str(e)}', 'refresh': False})
+
+        choice = response.choices[0]
+        message = choice.message
+        finish_reason = choice.finish_reason
+
+        # Build assistant message for history
+        asst_msg = {"role": "assistant", "content": message.content or ""}
+        if message.tool_calls:
+            asst_msg["tool_calls"] = [
+                {"id": tc.id, "type": "function",
+                 "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                for tc in message.tool_calls
+            ]
+        all_messages.append(asst_msg)
+
+        if finish_reason == "tool_calls" and message.tool_calls:
+            did_tool_calls = True
+            for tc in message.tool_calls:
+                try:
+                    tool_args = json.loads(tc.function.arguments)
+                except Exception:
+                    tool_args = {}
+                result = execute_tool(tc.function.name, tool_args)
+                all_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": json.dumps(result, ensure_ascii=False, default=str)
+                })
+        else:
+            return jsonify({
+                "response": message.content or "Acción completada.",
+                "refresh": did_tool_calls
+            })
+
+    return jsonify({"response": "No pude completar la operación en los pasos permitidos.", "refresh": did_tool_calls})
+
+# ============================================================================
+# FRONTEND
 # ============================================================================
 
 HTML = """
@@ -826,6 +984,59 @@ input,select,textarea{font-family:inherit;}
 .empty{text-align:center;padding:40px;color:var(--text2);}
 .empty-icon{font-size:32px;margin-bottom:10px;opacity:.4;}
 .active-filter{border-color:var(--green)!important;color:var(--green)!important;background:var(--green-dim)!important;}
+
+/* ══ CHATBOT ══ */
+.chat-fab{position:fixed;bottom:22px;right:22px;z-index:800;width:48px;height:48px;
+  border-radius:50%;background:var(--purple);border:2px solid rgba(124,63,255,.4);
+  color:#fff;font-size:20px;cursor:pointer;box-shadow:0 4px 24px rgba(124,63,255,.5);
+  transition:all .2s;display:flex;align-items:center;justify-content:center;}
+.chat-fab:hover{transform:scale(1.08);box-shadow:0 6px 32px rgba(124,63,255,.7);}
+.chat-fab.open{background:var(--bg3);border-color:var(--border2);font-size:14px;}
+.chat-panel{position:fixed;bottom:82px;right:22px;z-index:800;width:370px;
+  background:var(--bg2);border:1px solid var(--border3);border-radius:12px;
+  box-shadow:var(--shadow-lg);display:none;flex-direction:column;overflow:hidden;
+  max-height:520px;}
+.chat-panel.open{display:flex;animation:slideUp .18s ease;}
+.chat-head{padding:11px 15px;border-bottom:1px solid var(--border);background:var(--bg3);
+  display:flex;align-items:center;gap:10px;flex-shrink:0;}
+.chat-head-icon{font-size:18px;width:32px;height:32px;background:var(--purple-dim);
+  border:1px solid rgba(124,63,255,.3);border-radius:8px;display:flex;align-items:center;
+  justify-content:center;flex-shrink:0;}
+.chat-head-info{flex:1;min-width:0;}
+.chat-head-title{font-family:var(--sans);font-weight:800;font-size:13px;color:var(--purple-light);}
+.chat-head-sub{font-size:9px;color:var(--text2);letter-spacing:.07em;text-transform:uppercase;}
+.chat-online{width:7px;height:7px;border-radius:50%;background:var(--green);
+  box-shadow:0 0 8px var(--green);flex-shrink:0;}
+.chat-messages{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;
+  gap:8px;min-height:80px;}
+.chat-msg{display:flex;flex-direction:column;}
+.chat-msg.user{align-items:flex-end;}
+.chat-msg.bot{align-items:flex-start;}
+.chat-bubble{padding:8px 12px;border-radius:10px;font-size:12px;line-height:1.55;
+  max-width:92%;word-break:break-word;}
+.chat-msg.user .chat-bubble{background:var(--purple);color:#fff;border-bottom-right-radius:3px;}
+.chat-msg.bot .chat-bubble{background:var(--bg4);color:var(--text0);border-bottom-left-radius:3px;
+  border:1px solid var(--border2);}
+.chat-typing-wrap{display:flex;align-items:center;gap:6px;padding:8px 12px;}
+.chat-dot{width:6px;height:6px;border-radius:50%;background:var(--purple-light);
+  animation:typingPulse 1.2s infinite;}
+.chat-dot:nth-child(2){animation-delay:.2s;}
+.chat-dot:nth-child(3){animation-delay:.4s;}
+@keyframes typingPulse{0%,80%,100%{opacity:.25;transform:scale(.7)}40%{opacity:1;transform:scale(1)}}
+.chat-input-wrap{padding:9px 12px;border-top:1px solid var(--border);display:flex;
+  gap:7px;flex-shrink:0;background:var(--bg2);}
+.chat-input{flex:1;background:var(--bg3);border:1px solid var(--border2);border-radius:6px;
+  color:var(--text0);font-size:12px;padding:7px 10px;outline:none;resize:none;
+  font-family:var(--mono);line-height:1.4;max-height:80px;}
+.chat-input:focus{border-color:var(--purple);}
+.chat-send{width:34px;height:34px;background:var(--purple);border:none;border-radius:6px;
+  color:#fff;font-size:14px;cursor:pointer;flex-shrink:0;display:flex;align-items:center;
+  justify-content:center;transition:all .15s;align-self:flex-end;}
+.chat-send:hover:not(:disabled){background:var(--purple-light);}
+.chat-send:disabled{opacity:.35;cursor:not-allowed;}
+.chat-tool-badge{display:inline-flex;align-items:center;gap:4px;font-size:9px;
+  color:var(--purple-light);background:var(--purple-dim);border:1px solid rgba(124,63,255,.3);
+  border-radius:3px;padding:1px 6px;margin-top:3px;}
 </style>
 </head>
 <body>
@@ -1374,10 +1585,10 @@ function renderCRM(){
 function ccHTML(c){
   const fu=c.next_followup?`<div class="cc-follow">📅 <span class="dv">${c.next_followup}</span></div>`:'';
   const notes=c.notes?`<div class="cc-notes">${c.notes.slice(0,75)}${c.notes.length>75?'…':''}</div>`:'';
-  return `<div class="contact-card" onclick="openContactModal(${c.id})">
+  return `<div class="contact-card" onclick="openContactModal('${c.id}')">
     <div class="cc-actions">
-      <button class="ca-btn" title="Avanzar" onclick="event.stopPropagation();advanceStatus(${c.id})">▶</button>
-      <button class="ca-btn del" title="Eliminar" onclick="event.stopPropagation();quickDelContact(${c.id})">✕</button>
+      <button class="ca-btn" title="Avanzar" onclick="event.stopPropagation();advanceStatus('${c.id}')">▶</button>
+      <button class="ca-btn del" title="Eliminar" onclick="event.stopPropagation();quickDelContact('${c.id}')">✕</button>
     </div>
     <div class="cc-name">${c.name}</div>
     <div class="cc-medio">${[c.medio,c.empresa].filter(Boolean).join(' · ')}</div>
@@ -1472,13 +1683,13 @@ function renderDev(){
         const mopen=state.modules[mod]!==false;
         const isLast=mi===modules.length-1;
         modHtml+=`<div class="dev-module">
-          <div class="dev-mod-head ${!mopen&&isLast?'last-closed':''}" onclick="toggleMod(${prod.id},'${mod}')">
+          <div class="dev-mod-head ${!mopen&&isLast?'last-closed':''}" onclick="toggleMod('${prod.id}','${mod}')">
             <span class="chevron ${mopen?'open':''}">▶</span>
             <div class="dev-mod-title">${mod}<span class="dev-mod-meta">${mdone}/${mtasks.length}</span></div>
             <div style="display:flex;align-items:center;gap:7px;margin-left:auto">
               <div class="prog-track"><div class="prog-fill" style="width:${mpct}%;background:${clr}"></div></div>
               <span class="prog-pct" style="color:${clr}">${mpct}%</span>
-              <button class="btn btn-sm btn-icon" onclick="event.stopPropagation();openTaskModal(null,${prod.id},'${mod}')">+</button>
+              <button class="btn btn-sm btn-icon" onclick="event.stopPropagation();openTaskModal(null,'${prod.id}','${mod}')">+</button>
             </div>
           </div>
           ${mopen?`<div class="dev-task-list">${mtasks.map(t=>dtHTML(t,clr)).join('')}</div>`:''}
@@ -1486,7 +1697,7 @@ function renderDev(){
       });
     }
 
-    el.innerHTML=`<div class="dev-prod-head" onclick="toggleProd(${prod.id})">
+    el.innerHTML=`<div class="dev-prod-head" onclick="toggleProd('${prod.id}')">
         <span class="chevron ${state.open?'open':''}">▶</span>
         <span class="dev-prod-icon">${prod.icon}</span>
         <div class="dev-prod-name" style="color:${clr}">${prod.name}</div>
@@ -1497,8 +1708,8 @@ function renderDev(){
           <span style="font-size:10px;color:var(--text2)">${pdone}/${ptasks.length}</span>
         </div>
         <div class="dev-prod-actions">
-          <button class="ca-btn" onclick="event.stopPropagation();openProductModal(${prod.id})" title="Editar producto">✎</button>
-          <button class="ca-btn" onclick="event.stopPropagation();openTaskModal(null,${prod.id},null)" title="Nueva task">+</button>
+          <button class="ca-btn" onclick="event.stopPropagation();openProductModal('${prod.id}')" title="Editar producto">✎</button>
+          <button class="ca-btn" onclick="event.stopPropagation();openTaskModal(null,'${prod.id}',null)" title="Nueva task">+</button>
         </div>
       </div>
       ${state.open?`<div class="dev-prod-body">${modHtml}${modules.length===0?'<div style="padding:14px 52px;font-size:11px;color:var(--text2)">Sin tasks. Agregá una con + Task.</div>':''}</div>`:''}`;
@@ -1510,13 +1721,13 @@ function dtHTML(t,clr='#00e5ff'){
   const cc=t.done?'checked':(t.status==='doing'?'doing':'');
   const ct=t.done?'✓':(t.status==='doing'?'●':'');
   return `<div class="dev-task">
-    <div class="dtc ${cc}" onclick="toggleTask(${t.id})">${ct}</div>
+    <div class="dtc ${cc}" onclick="toggleTask('${t.id}')">${ct}</div>
     <div class="dt-info">
       <div class="dt-name ${t.done?'done':''}">${t.name}</div>
       ${t.description?`<div class="dt-desc">${t.description}</div>`:''}
       <div class="dt-tags"><span class="sp sp-${t.status}">${t.status}</span><span class="tag tag-${t.priority}">${t.priority}</span><span style="font-size:9px;color:var(--text2)">↑ ${t.impact}</span></div>
     </div>
-    <div class="dt-actions"><button class="ca-btn" onclick="openTaskModal(${t.id})" title="Editar">✎</button></div>
+    <div class="dt-actions"><button class="ca-btn" onclick="openTaskModal('${t.id}')" title="Editar">✎</button></div>
   </div>`;
 }
 
@@ -1640,17 +1851,17 @@ function renderCampaign(){
     const div=document.createElement('div');div.className='camp-card';
     div.innerHTML=`<div class="camp-card-header">
       <div class="camp-card-title">${c.icon} ${c.name}</div>
-      <button class="btn btn-danger btn-sm btn-icon" onclick="deleteCampaign(${c.id})">✕</button></div>
+      <button class="btn btn-danger btn-sm btn-icon" onclick="deleteCampaign('${c.id}')">✕</button></div>
       <div class="camp-card-body">
         <div class="camp-mg">
-          <div class="cmi"><label>Visitas</label><input type="number" class="c" value="${c.visitas}" onchange="uCF(${c.id},'visitas',this.value)"/></div>
-          <div class="cmi"><label>Conv %</label><input type="number" step="0.1" class="o" value="${c.conversion}" onchange="uCF(${c.id},'conversion',this.value)"/></div>
-          <div class="cmi"><label>Leads</label><input type="number" class="p" value="${c.leads}" onchange="uCF(${c.id},'leads',this.value)"/></div>
-          <div class="cmi"><label>Backers</label><input type="number" class="g" value="${c.backers}" onchange="uCF(${c.id},'backers',this.value)"/></div>
+          <div class="cmi"><label>Visitas</label><input type="number" class="c" value="${c.visitas}" onchange="uCF('${c.id}','visitas',this.value)"/></div>
+          <div class="cmi"><label>Conv %</label><input type="number" step="0.1" class="o" value="${c.conversion}" onchange="uCF('${c.id}','conversion',this.value)"/></div>
+          <div class="cmi"><label>Leads</label><input type="number" class="p" value="${c.leads}" onchange="uCF('${c.id}','leads',this.value)"/></div>
+          <div class="cmi"><label>Backers</label><input type="number" class="g" value="${c.backers}" onchange="uCF('${c.id}','backers',this.value)"/></div>
         </div>
         <div class="camp-notes-row">
-          <textarea rows="2" placeholder="Notas de iteración..." onchange="uCF(${c.id},'notes',this.value)">${c.notes||''}</textarea>
-          <button class="btn btn-sm btn-primary" onclick="saveCampRow(${c.id})" style="flex-shrink:0">💾</button>
+          <textarea rows="2" placeholder="Notas de iteración..." onchange="uCF('${c.id}','notes',this.value)">${c.notes||''}</textarea>
+          <button class="btn btn-sm btn-primary" onclick="saveCampRow('${c.id}')" style="flex-shrink:0">💾</button>
         </div>
       </div>`;
     wrap.appendChild(div);
@@ -1736,7 +1947,7 @@ function renderStrategy(){
     const clr=LOG_C[l.type]||'#4e6880';
     const links=Array.isArray(l.links)?l.links:[];
     return `<div class="log-entry" style="--lc:${clr}">
-      <button class="btn btn-sm btn-danger btn-icon log-del" onclick="deleteLog(${l.id})">✕</button>
+      <button class="btn btn-sm btn-danger btn-icon log-del" onclick="deleteLog('${l.id}')">✕</button>
       <div class="log-header"><span class="log-badge">${l.type}</span>${l.title?`<span class="log-title">${l.title}</span>`:''}<span class="log-date">${l.date||''}</span></div>
       <div class="log-text">${l.text}</div>
       ${links.length?`<div class="log-links">${links.map(lk=>`<span class="log-link-tag">🔗 ${lk}</span>`).join('')}</div>`:''}</div>`;
@@ -1785,8 +1996,109 @@ document.addEventListener('keydown',e=>{
   const map={'1':'crm','2':'dev','3':'campaign','4':'strategy','5':'guide'};
   if(map[e.key])switchPanel(map[e.key]);
 });
+// ══ CHATBOT ══
+let chatHistory=[];
+let chatOpen=false;
+
+function toggleChat(){
+  chatOpen=!chatOpen;
+  document.getElementById('chat-panel').classList.toggle('open',chatOpen);
+  const fab=document.getElementById('chat-fab');
+  fab.classList.toggle('open',chatOpen);
+  fab.textContent=chatOpen?'✕':'🤖';
+  if(chatOpen&&chatHistory.length===0){
+    appendMsg('bot','De su orden. ¿Qué necesitás cargar o actualizar en el sistema? Podés decirme algo como:<br><em>"Cargá el producto X y creá las tareas A, B, C"</em>');
+  }
+  document.getElementById('chat-messages').scrollTop=9999;
+}
+
+function appendMsg(role,html){
+  chatHistory.push({role:role==='user'?'user':'assistant',content:html.replace(/<[^>]+>/g,'')});
+  const wrap=document.getElementById('chat-messages');
+  const div=document.createElement('div');
+  div.className='chat-msg '+(role==='user'?'user':'bot');
+  div.innerHTML=`<div class="chat-bubble">${html}</div>`;
+  wrap.appendChild(div);
+  wrap.scrollTop=wrap.scrollHeight;
+}
+
+function showTyping(){
+  const wrap=document.getElementById('chat-messages');
+  const div=document.createElement('div');
+  div.id='chat-typing-indicator';div.className='chat-msg bot';
+  div.innerHTML='<div class="chat-bubble chat-typing-wrap"><div class="chat-dot"></div><div class="chat-dot"></div><div class="chat-dot"></div></div>';
+  wrap.appendChild(div);wrap.scrollTop=wrap.scrollHeight;
+}
+
+function hideTyping(){
+  const el=document.getElementById('chat-typing-indicator');if(el)el.remove();
+}
+
+async function sendChat(){
+  const input=document.getElementById('chat-input');
+  const text=input.value.trim();if(!text)return;
+  input.value='';input.style.height='';
+  appendMsg('user',text);
+  showTyping();
+  document.getElementById('chat-send').disabled=true;
+  try{
+    // Send only last 12 turns to avoid token overflow
+    const msgs=chatHistory.slice(-12);
+    const res=await fetch('/api/chat',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({messages:msgs})
+    });
+    if(!res.ok)throw new Error('HTTP '+res.status);
+    const data=await res.json();
+    hideTyping();
+    appendMsg('bot',data.response||'Acción completada.');
+    if(data.refresh){
+      await Promise.all([loadProducts(),loadTasks(),loadStats()]);
+      renderDev();renderStats();
+      toast('Sistema actualizado','success');
+    }
+  }catch(e){
+    hideTyping();appendMsg('bot','⚠ Error: '+e.message);
+  }finally{
+    document.getElementById('chat-send').disabled=false;
+  }
+}
+
+document.addEventListener('DOMContentLoaded',()=>{
+  const ci=document.getElementById('chat-input');
+  if(ci){
+    ci.addEventListener('keydown',e=>{
+      if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat();}
+    });
+    ci.addEventListener('input',function(){
+      this.style.height='auto';
+      this.style.height=Math.min(this.scrollHeight,80)+'px';
+    });
+  }
+});
+
 boot();
 </script>
+
+<!-- ══ CHATBOT WIDGET ══ -->
+<button class="chat-fab" id="chat-fab" onclick="toggleChat()" title="Asistente IA">🤖</button>
+<div class="chat-panel" id="chat-panel">
+  <div class="chat-head">
+    <div class="chat-head-icon">🤖</div>
+    <div class="chat-head-info">
+      <div class="chat-head-title">Asistente IA</div>
+      <div class="chat-head-sub">Groq · De su orden</div>
+    </div>
+    <div class="chat-online"></div>
+  </div>
+  <div class="chat-messages" id="chat-messages"></div>
+  <div class="chat-input-wrap">
+    <textarea class="chat-input" id="chat-input"
+      placeholder="Cargá productos, tasks… (Enter = enviar, Shift+Enter = nueva línea)"
+      rows="1"></textarea>
+    <button class="chat-send" id="chat-send" onclick="sendChat()">➤</button>
+  </div>
+</div>
 </body>
 </html>
 """
@@ -1796,7 +2108,7 @@ def index():
     return HTML, 200, {'Content-Type': 'text/html; charset=utf-8'}
 
 if __name__ == '__main__':
-    print("\n  OpenAETH Command Core — MongoDB")
-    print(f"  DB: {MONGODB_DB}")
+    print("\n  OpenAETH Command Core — MongoDB + Groq AI")
+    print(f"  DB: {MONGODB_DB}  |  Groq: {'✓' if groq_client else '✗'}")
     print("  → http://localhost:5000\n")
     app.run(debug=False, host='0.0.0.0', port=5000)
