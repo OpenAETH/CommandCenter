@@ -1,161 +1,65 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from sqlalchemy import create_engine, text
-from sqlalchemy.pool import QueuePool
+from pymongo import MongoClient
+from pymongo.server_api import ServerApi
+from bson import ObjectId
 from datetime import datetime
 import os
-import json
-import socket
-import psycopg2
-import psycopg2.extras
-import time
-from functools import wraps
+import certifi
 
 app = Flask(__name__)
 CORS(app)
 
-DATABASE_URL = os.environ.get(
-    'DATABASE_URL',
-    'postgresql://postgres:[YOUR-PASSWORD]@db.bgjjmeenermkwxqewaml.supabase.co:5432/postgres'
+# ============================================================================
+# MONGODB CONNECTION
+# ============================================================================
+
+MONGODB_URI = os.environ.get('MONGODB_URI', '')
+MONGODB_DB  = os.environ.get('MONGODB_DB', 'commandcenter')
+
+client = MongoClient(
+    MONGODB_URI,
+    server_api=ServerApi("1"),
+    tls=True,
+    tlsCAFile=certifi.where(),
+    serverSelectionTimeoutMS=5000,
 )
+db = client[MONGODB_DB]
 
 # ============================================================================
-# CONFIGURACIÓN OPTIMIZADA PARA EVITAR 502
+# HELPERS
 # ============================================================================
 
-# Timeouts para prevenir conexiones colgadas
-CONNECT_TIMEOUT = 10  # segundos
-STATEMENT_TIMEOUT = 30000  # milisegundos (30 segundos)
-IDLE_IN_TRANSACTION_SESSION_TIMEOUT = 30000  # milisegundos
-
-def _parse_db_url(url: str) -> dict:
-    """Descompone la DATABASE_URL en sus partes."""
-    import re
-    m = re.match(
-        r'postgresql://([^:]+):([^@]+)@([^:/]+):?(\d+)?/(.+)',
-        url
-    )
-    if not m:
-        raise ValueError(f"DATABASE_URL con formato inválido: {url}")
-    return {
-        'user':     m.group(1),
-        'password': m.group(2),
-        'host':     m.group(3),
-        'port':     int(m.group(4) or 5432),
-        'dbname':   m.group(5).split('?')[0],
-    }
-
-def _make_ipv4_connection():
-    """
-    Crea una conexión psycopg2 optimizada para Supabase.
-    Incluye timeouts para prevenir conexiones colgadas.
-    """
-    p = _parse_db_url(DATABASE_URL)
-    
-    # Resolver IPv4 con timeout
-    try:
-        socket.setdefaulttimeout(CONNECT_TIMEOUT)
-        ipv4 = socket.getaddrinfo(
-            p['host'], 
-            p['port'], 
-            socket.AF_INET, 
-            socket.SOCK_STREAM
-        )[0][4][0]
-    except Exception as e:
-        print(f"Error resolviendo DNS: {e}")
-        raise
-    
-    # Opciones de conexión optimizadas
-    conn = psycopg2.connect(
-        host=p['host'],
-        hostaddr=ipv4,
-        port=p['port'],
-        user=p['user'],
-        password=p['password'],
-        dbname=p['dbname'],
-        sslmode='require',
-        connect_timeout=CONNECT_TIMEOUT,
-        # Timeouts a nivel de statement
-        options=f'-c statement_timeout={STATEMENT_TIMEOUT} '
-                f'-c idle_in_transaction_session_timeout={IDLE_IN_TRANSACTION_SESSION_TIMEOUT}',
-        # Configuración TCP
-        keepalives=1,
-        keepalives_idle=30,
-        keepalives_interval=10,
-        keepalives_count=5,
-        application_name='openaeth_api'
-    )
-    
-    return conn
-
-# Pool configuration optimizada
-engine = create_engine(
-    "postgresql+psycopg2://",
-    creator=_make_ipv4_connection,
-    # Pool más pequeño pero más ágil
-    pool_size=3,
-    max_overflow=5,
-    # Tiempo de espera para obtener conexión del pool
-    pool_timeout=10,
-    # Verificar conexión antes de usarla
-    pool_pre_ping=True,
-    # Reciclar conexiones cada 15 minutos
-    pool_recycle=900,
-    # Echo para debugging (desactivar en producción)
-    echo=False,
-)
-
-# ============================================================================
-# FUNCIONES AUXILIARES PARA MANEJO DE CONEXIONES
-# ============================================================================
-
-def row_to_dict(row):
-    """Convierte una Row de SQLAlchemy a dict serializable."""
-    if not row:
+def doc(d):
+    """Convert a MongoDB document to a JSON-serializable dict with 'id' field."""
+    if d is None:
         return None
-    d = dict(row._mapping)
-    for k, v in d.items():
+    d = dict(d)
+    d['id'] = str(d.pop('_id'))
+    for k, v in list(d.items()):
         if hasattr(v, 'isoformat'):
             d[k] = v.isoformat()
     return d
 
+def oid(s):
+    return ObjectId(s)
+
 # ============================================================================
-# HEALTH CHECK MEJORADO
+# HEALTH CHECK
 # ============================================================================
 
 @app.route('/api/health', methods=['GET'])
 def health():
-    """Health check mejorado con timeout."""
-    p = _parse_db_url(DATABASE_URL)
     try:
-        socket.setdefaulttimeout(5)
-        ipv4 = socket.getaddrinfo(p['host'], p['port'], socket.AF_INET)[0][4][0]
-        resolved = f"{p['host']} → {ipv4}:{p['port']}"
-    except Exception as e:
-        resolved = f"DNS error: {e}"
-        return jsonify({
-            'status': 'error',
-            'db': 'dns_failed',
-            'resolved': resolved
-        }), 500
-    
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-            conn.commit()
+        client.admin.command('ping')
         return jsonify({
             'status': 'ok',
             'db': 'connected',
-            'resolved': resolved,
+            'mongo_db': MONGODB_DB,
             'timestamp': datetime.now().isoformat()
         })
     except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'db': str(e),
-            'resolved': resolved,
-            'timestamp': datetime.now().isoformat()
-        }), 500
+        return jsonify({'status': 'error', 'db': str(e)}), 500
 
 # ============================================================================
 # ENDPOINTS CRM
@@ -164,11 +68,8 @@ def health():
 @app.route('/api/contacts', methods=['GET'])
 def get_contacts():
     try:
-        with engine.connect() as conn:
-            rows = conn.execute(
-                text("SELECT * FROM contacts ORDER BY updated_at DESC")
-            ).fetchall()
-            return jsonify([row_to_dict(r) for r in rows])
+        rows = list(db.contacts.find().sort('updated_at', -1))
+        return jsonify([doc(r) for r in rows])
     except Exception as e:
         print(f"Error in get_contacts: {e}")
         return jsonify({'error': str(e)}), 500
@@ -177,96 +78,76 @@ def get_contacts():
 def create_contact():
     d = request.json
     try:
-        with engine.begin() as conn:
-            row = conn.execute(text("""
-                INSERT INTO contacts (
-                    name, medio, empresa, tipo, status, email, 
-                    telefono, last_contact, next_followup, notes
-                )
-                VALUES (
-                    :name, :medio, :empresa, :tipo, :status, :email,
-                    :telefono, :last_contact, :next_followup, :notes
-                )
-                RETURNING *
-            """), {
-                'name': d.get('name', ''),
-                'medio': d.get('medio', ''),
-                'empresa': d.get('empresa', ''),
-                'tipo': d.get('tipo', 'prensa'),
-                'status': d.get('status', 'nuevo'),
-                'email': d.get('email', ''),
-                'telefono': d.get('telefono', ''),
-                'last_contact': d.get('last_contact', ''),
-                'next_followup': d.get('next_followup', ''),
-                'notes': d.get('notes', ''),
-            }).fetchone()
-            return jsonify(row_to_dict(row)), 201
+        now = datetime.utcnow()
+        contact = {
+            'name':         d.get('name', ''),
+            'medio':        d.get('medio', ''),
+            'empresa':      d.get('empresa', ''),
+            'tipo':         d.get('tipo', 'prensa'),
+            'status':       d.get('status', 'nuevo'),
+            'email':        d.get('email', ''),
+            'telefono':     d.get('telefono', ''),
+            'last_contact': d.get('last_contact', ''),
+            'next_followup':d.get('next_followup', ''),
+            'notes':        d.get('notes', ''),
+            'created_at':   now,
+            'updated_at':   now,
+        }
+        result = db.contacts.insert_one(contact)
+        contact['_id'] = result.inserted_id
+        return jsonify(doc(contact)), 201
     except Exception as e:
         print(f"Error in create_contact: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/contacts/<int:cid>', methods=['PUT'])
+@app.route('/api/contacts/<string:cid>', methods=['PUT'])
 def update_contact(cid):
     d = request.json
     try:
-        with engine.begin() as conn:
-            row = conn.execute(text("""
-                UPDATE contacts SET 
-                    name = :name,
-                    medio = :medio,
-                    empresa = :empresa,
-                    tipo = :tipo,
-                    status = :status,
-                    email = :email,
-                    telefono = :telefono,
-                    last_contact = :last_contact,
-                    next_followup = :next_followup,
-                    notes = :notes,
-                    updated_at = NOW()
-                WHERE id = :id 
-                RETURNING *
-            """), {**d, 'id': cid}).fetchone()
-            
-            if not row:
-                return jsonify({'error': 'Contact not found'}), 404
-            return jsonify(row_to_dict(row))
+        update = {
+            'name':         d.get('name', ''),
+            'medio':        d.get('medio', ''),
+            'empresa':      d.get('empresa', ''),
+            'tipo':         d.get('tipo', 'prensa'),
+            'status':       d.get('status', 'nuevo'),
+            'email':        d.get('email', ''),
+            'telefono':     d.get('telefono', ''),
+            'last_contact': d.get('last_contact', ''),
+            'next_followup':d.get('next_followup', ''),
+            'notes':        d.get('notes', ''),
+            'updated_at':   datetime.utcnow(),
+        }
+        result = db.contacts.find_one_and_update(
+            {'_id': oid(cid)}, {'$set': update}, return_document=True
+        )
+        if not result:
+            return jsonify({'error': 'Contact not found'}), 404
+        return jsonify(doc(result))
     except Exception as e:
         print(f"Error in update_contact: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/contacts/<int:cid>', methods=['DELETE'])
+@app.route('/api/contacts/<string:cid>', methods=['DELETE'])
 def delete_contact(cid):
     try:
-        with engine.begin() as conn:
-            conn.execute(
-                text("DELETE FROM contact_interactions WHERE contact_id = :id"), 
-                {'id': cid}
-            )
-            conn.execute(
-                text("DELETE FROM contacts WHERE id = :id"), 
-                {'id': cid}
-            )
-            return jsonify({'ok': True})
+        db.contacts.delete_one({'_id': oid(cid)})
+        return jsonify({'ok': True})
     except Exception as e:
         print(f"Error in delete_contact: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/contacts/<int:cid>/status', methods=['PATCH'])
+@app.route('/api/contacts/<string:cid>/status', methods=['PATCH'])
 def patch_contact_status(cid):
     d = request.json
     try:
-        with engine.begin() as conn:
-            row = conn.execute(text("""
-                UPDATE contacts SET 
-                    status = :status,
-                    updated_at = NOW() 
-                WHERE id = :id 
-                RETURNING *
-            """), {'status': d['status'], 'id': cid}).fetchone()
-            
-            if not row:
-                return jsonify({'error': 'Contact not found'}), 404
-            return jsonify(row_to_dict(row))
+        result = db.contacts.find_one_and_update(
+            {'_id': oid(cid)},
+            {'$set': {'status': d['status'], 'updated_at': datetime.utcnow()}},
+            return_document=True
+        )
+        if not result:
+            return jsonify({'error': 'Contact not found'}), 404
+        return jsonify(doc(result))
     except Exception as e:
         print(f"Error in patch_contact_status: {e}")
         return jsonify({'error': str(e)}), 500
@@ -278,11 +159,8 @@ def patch_contact_status(cid):
 @app.route('/api/products', methods=['GET'])
 def get_products():
     try:
-        with engine.connect() as conn:
-            rows = conn.execute(
-                text("SELECT * FROM products ORDER BY sort_order, id")
-            ).fetchall()
-            return jsonify([row_to_dict(r) for r in rows])
+        rows = list(db.products.find().sort([('sort_order', 1), ('_id', 1)]))
+        return jsonify([doc(r) for r in rows])
     except Exception as e:
         print(f"Error in get_products: {e}")
         return jsonify({'error': str(e)}), 500
@@ -291,66 +169,54 @@ def get_products():
 def create_product():
     d = request.json
     try:
-        with engine.begin() as conn:
-            max_order = conn.execute(
-                text("SELECT COALESCE(MAX(sort_order), 0) + 1 AS n FROM products")
-            ).scalar()
-            
-            row = conn.execute(text("""
-                INSERT INTO products (name, icon, description, status, color, sort_order)
-                VALUES (:name, :icon, :description, :status, :color, :sort_order)
-                RETURNING *
-            """), {
-                'name': d.get('name'),
-                'icon': d.get('icon', '📦'),
-                'description': d.get('description', ''),
-                'status': d.get('status', 'activo'),
-                'color': d.get('color', '#00e5ff'),
-                'sort_order': max_order,
-            }).fetchone()
-            
-            return jsonify(row_to_dict(row)), 201
+        now = datetime.utcnow()
+        max_order = db.products.count_documents({}) + 1
+        product = {
+            'name':        d.get('name'),
+            'icon':        d.get('icon', '\U0001f4e6'),
+            'description': d.get('description', ''),
+            'status':      d.get('status', 'activo'),
+            'color':       d.get('color', '#00e5ff'),
+            'sort_order':  max_order,
+            'created_at':  now,
+            'updated_at':  now,
+        }
+        result = db.products.insert_one(product)
+        product['_id'] = result.inserted_id
+        return jsonify(doc(product)), 201
     except Exception as e:
         print(f"Error in create_product: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/products/<int:pid>', methods=['PUT'])
+@app.route('/api/products/<string:pid>', methods=['PUT'])
 def update_product(pid):
     d = request.json
     try:
-        with engine.begin() as conn:
-            row = conn.execute(text("""
-                UPDATE products SET 
-                    name = :name,
-                    icon = :icon,
-                    description = :description,
-                    status = :status,
-                    color = :color,
-                    updated_at = NOW() 
-                WHERE id = :id 
-                RETURNING *
-            """), {**d, 'id': pid}).fetchone()
-            
-            if not row:
-                return jsonify({'error': 'Product not found'}), 404
-            return jsonify(row_to_dict(row))
+        update = {
+            'name':        d.get('name'),
+            'icon':        d.get('icon', '\U0001f4e6'),
+            'description': d.get('description', ''),
+            'status':      d.get('status', 'activo'),
+            'color':       d.get('color', '#00e5ff'),
+            'updated_at':  datetime.utcnow(),
+        }
+        result = db.products.find_one_and_update(
+            {'_id': oid(pid)}, {'$set': update}, return_document=True
+        )
+        if not result:
+            return jsonify({'error': 'Product not found'}), 404
+        return jsonify(doc(result))
     except Exception as e:
         print(f"Error in update_product: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/products/<int:pid>', methods=['DELETE'])
+@app.route('/api/products/<string:pid>', methods=['DELETE'])
 def delete_product(pid):
     try:
-        with engine.begin() as conn:
-            conn.execute(
-                text("DELETE FROM tasks WHERE product_id = :id"), 
-                {'id': pid}
-            )
-            conn.execute(
-                text("DELETE FROM products WHERE id = :id"), 
-                {'id': pid}
-            )
-            return jsonify({'ok': True})
+        # Delete all tasks belonging to this product first
+        db.tasks.delete_many({'product_id': pid})
+        db.products.delete_one({'_id': oid(pid)})
+        return jsonify({'ok': True})
     except Exception as e:
         print(f"Error in delete_product: {e}")
         return jsonify({'error': str(e)}), 500
@@ -362,11 +228,8 @@ def delete_product(pid):
 @app.route('/api/tasks', methods=['GET'])
 def get_tasks():
     try:
-        with engine.connect() as conn:
-            rows = conn.execute(
-                text("SELECT * FROM tasks ORDER BY product_id, module, id")
-            ).fetchall()
-            return jsonify([row_to_dict(r) for r in rows])
+        rows = list(db.tasks.find().sort([('product_id', 1), ('module', 1), ('_id', 1)]))
+        return jsonify([doc(r) for r in rows])
     except Exception as e:
         print(f"Error in get_tasks: {e}")
         return jsonify({'error': str(e)}), 500
@@ -375,97 +238,76 @@ def get_tasks():
 def create_task():
     d = request.json
     try:
-        with engine.begin() as conn:
-            done = 1 if d.get('status') == 'done' else 0
-            row = conn.execute(text("""
-                INSERT INTO tasks (
-                    product_id, module, name, description, 
-                    status, priority, impact, done
-                )
-                VALUES (
-                    :product_id, :module, :name, :description,
-                    :status, :priority, :impact, :done
-                )
-                RETURNING *
-            """), {
-                'product_id': d.get('product_id'),
-                'module': d.get('module', 'Backend'),
-                'name': d.get('name'),
-                'description': d.get('description', ''),
-                'status': d.get('status', 'todo'),
-                'priority': d.get('priority', 'medio'),
-                'impact': d.get('impact', 'medio'),
-                'done': done,
-            }).fetchone()
-            
-            return jsonify(row_to_dict(row)), 201
+        now = datetime.utcnow()
+        done = 1 if d.get('status') == 'done' else 0
+        task = {
+            'product_id':  d.get('product_id'),   # stored as string ObjectId
+            'module':      d.get('module', 'Backend'),
+            'name':        d.get('name'),
+            'description': d.get('description', ''),
+            'status':      d.get('status', 'todo'),
+            'priority':    d.get('priority', 'medio'),
+            'impact':      d.get('impact', 'medio'),
+            'done':        done,
+            'created_at':  now,
+            'updated_at':  now,
+        }
+        result = db.tasks.insert_one(task)
+        task['_id'] = result.inserted_id
+        return jsonify(doc(task)), 201
     except Exception as e:
         print(f"Error in create_task: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/tasks/<int:tid>', methods=['PUT'])
+@app.route('/api/tasks/<string:tid>', methods=['PUT'])
 def update_task(tid):
     d = request.json
     try:
-        with engine.begin() as conn:
-            done = 1 if d.get('done') or d.get('status') == 'done' else 0
-            row = conn.execute(text("""
-                UPDATE tasks SET 
-                    product_id = :product_id,
-                    module = :module,
-                    name = :name,
-                    description = :description,
-                    status = :status,
-                    priority = :priority,
-                    impact = :impact,
-                    done = :done,
-                    updated_at = NOW()
-                WHERE id = :id 
-                RETURNING *
-            """), {**d, 'done': done, 'id': tid}).fetchone()
-            
-            if not row:
-                return jsonify({'error': 'Task not found'}), 404
-            return jsonify(row_to_dict(row))
+        done = 1 if (d.get('done') or d.get('status') == 'done') else 0
+        update = {
+            'product_id':  d.get('product_id'),
+            'module':      d.get('module', 'Backend'),
+            'name':        d.get('name'),
+            'description': d.get('description', ''),
+            'status':      d.get('status', 'todo'),
+            'priority':    d.get('priority', 'medio'),
+            'impact':      d.get('impact', 'medio'),
+            'done':        done,
+            'updated_at':  datetime.utcnow(),
+        }
+        result = db.tasks.find_one_and_update(
+            {'_id': oid(tid)}, {'$set': update}, return_document=True
+        )
+        if not result:
+            return jsonify({'error': 'Task not found'}), 404
+        return jsonify(doc(result))
     except Exception as e:
         print(f"Error in update_task: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/tasks/<int:tid>/toggle', methods=['PATCH'])
+@app.route('/api/tasks/<string:tid>/toggle', methods=['PATCH'])
 def toggle_task(tid):
     try:
-        with engine.begin() as conn:
-            current = conn.execute(
-                text("SELECT done FROM tasks WHERE id = :id"), 
-                {'id': tid}
-            ).fetchone()
-            
-            if not current:
-                return jsonify({'error': 'Task not found'}), 404
-                
-            new_done = 0 if current.done else 1
-            new_status = 'done' if new_done else 'doing'
-            
-            row = conn.execute(text("""
-                UPDATE tasks SET 
-                    done = :done,
-                    status = :status,
-                    updated_at = NOW() 
-                WHERE id = :id 
-                RETURNING *
-            """), {'done': new_done, 'status': new_status, 'id': tid}).fetchone()
-            
-            return jsonify(row_to_dict(row))
+        current = db.tasks.find_one({'_id': oid(tid)})
+        if not current:
+            return jsonify({'error': 'Task not found'}), 404
+        new_done = 0 if current.get('done') else 1
+        new_status = 'done' if new_done else 'doing'
+        result = db.tasks.find_one_and_update(
+            {'_id': oid(tid)},
+            {'$set': {'done': new_done, 'status': new_status, 'updated_at': datetime.utcnow()}},
+            return_document=True
+        )
+        return jsonify(doc(result))
     except Exception as e:
         print(f"Error in toggle_task: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/tasks/<int:tid>', methods=['DELETE'])
+@app.route('/api/tasks/<string:tid>', methods=['DELETE'])
 def delete_task(tid):
     try:
-        with engine.begin() as conn:
-            conn.execute(text("DELETE FROM tasks WHERE id = :id"), {'id': tid})
-            return jsonify({'ok': True})
+        db.tasks.delete_one({'_id': oid(tid)})
+        return jsonify({'ok': True})
     except Exception as e:
         print(f"Error in delete_task: {e}")
         return jsonify({'error': str(e)}), 500
@@ -477,11 +319,8 @@ def delete_task(tid):
 @app.route('/api/campaigns', methods=['GET'])
 def get_campaigns():
     try:
-        with engine.connect() as conn:
-            rows = conn.execute(
-                text("SELECT * FROM campaigns ORDER BY id")
-            ).fetchall()
-            return jsonify([row_to_dict(r) for r in rows])
+        rows = list(db.campaigns.find().sort('_id', 1))
+        return jsonify([doc(r) for r in rows])
     except Exception as e:
         print(f"Error in get_campaigns: {e}")
         return jsonify({'error': str(e)}), 500
@@ -490,61 +329,54 @@ def get_campaigns():
 def create_campaign():
     d = request.json
     try:
-        with engine.begin() as conn:
-            row = conn.execute(text("""
-                INSERT INTO campaigns (name, icon, visitas, conversion, leads, backers, notes)
-                VALUES (:name, :icon, :visitas, :conversion, :leads, :backers, :notes)
-                RETURNING *
-            """), {
-                'name': d.get('name'),
-                'icon': d.get('icon', '📊'),
-                'visitas': d.get('visitas', 0),
-                'conversion': d.get('conversion', 0),
-                'leads': d.get('leads', 0),
-                'backers': d.get('backers', 0),
-                'notes': d.get('notes', ''),
-            }).fetchone()
-            
-            return jsonify(row_to_dict(row)), 201
+        now = datetime.utcnow()
+        campaign = {
+            'name':       d.get('name'),
+            'icon':       d.get('icon', '\U0001f4ca'),
+            'visitas':    d.get('visitas', 0),
+            'conversion': d.get('conversion', 0),
+            'leads':      d.get('leads', 0),
+            'backers':    d.get('backers', 0),
+            'notes':      d.get('notes', ''),
+            'created_at': now,
+            'updated_at': now,
+        }
+        result = db.campaigns.insert_one(campaign)
+        campaign['_id'] = result.inserted_id
+        return jsonify(doc(campaign)), 201
     except Exception as e:
         print(f"Error in create_campaign: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/campaigns/<int:cid>', methods=['PUT'])
+@app.route('/api/campaigns/<string:cid>', methods=['PUT'])
 def update_campaign(cid):
     d = request.json
     try:
-        with engine.begin() as conn:
-            row = conn.execute(text("""
-                UPDATE campaigns SET 
-                    name = :name,
-                    icon = :icon,
-                    visitas = :visitas,
-                    conversion = :conversion,
-                    leads = :leads,
-                    backers = :backers,
-                    notes = :notes,
-                    updated_at = NOW()
-                WHERE id = :id 
-                RETURNING *
-            """), {**d, 'id': cid}).fetchone()
-            
-            if not row:
-                return jsonify({'error': 'Campaign not found'}), 404
-            return jsonify(row_to_dict(row))
+        update = {
+            'name':       d.get('name'),
+            'icon':       d.get('icon', '\U0001f4ca'),
+            'visitas':    d.get('visitas', 0),
+            'conversion': d.get('conversion', 0),
+            'leads':      d.get('leads', 0),
+            'backers':    d.get('backers', 0),
+            'notes':      d.get('notes', ''),
+            'updated_at': datetime.utcnow(),
+        }
+        result = db.campaigns.find_one_and_update(
+            {'_id': oid(cid)}, {'$set': update}, return_document=True
+        )
+        if not result:
+            return jsonify({'error': 'Campaign not found'}), 404
+        return jsonify(doc(result))
     except Exception as e:
         print(f"Error in update_campaign: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/campaigns/<int:cid>', methods=['DELETE'])
+@app.route('/api/campaigns/<string:cid>', methods=['DELETE'])
 def delete_campaign(cid):
     try:
-        with engine.begin() as conn:
-            conn.execute(
-                text("DELETE FROM campaigns WHERE id = :id"), 
-                {'id': cid}
-            )
-            return jsonify({'ok': True})
+        db.campaigns.delete_one({'_id': oid(cid)})
+        return jsonify({'ok': True})
     except Exception as e:
         print(f"Error in delete_campaign: {e}")
         return jsonify({'error': str(e)}), 500
@@ -556,20 +388,14 @@ def delete_campaign(cid):
 @app.route('/api/logs', methods=['GET'])
 def get_logs():
     try:
-        with engine.connect() as conn:
-            rows = conn.execute(
-                text("SELECT * FROM strategy_logs ORDER BY created_at DESC")
-            ).fetchall()
-            
-            result = []
-            for r in rows:
-                d = row_to_dict(r)
-                try:
-                    d['links'] = json.loads(d['links'] or '[]')
-                except:
-                    d['links'] = []
-                result.append(d)
-            return jsonify(result)
+        rows = list(db.strategy_logs.find().sort('created_at', -1))
+        result = []
+        for r in rows:
+            d = doc(r)
+            if not isinstance(d.get('links'), list):
+                d['links'] = []
+            result.append(d)
+        return jsonify(result)
     except Exception as e:
         print(f"Error in get_logs: {e}")
         return jsonify({'error': str(e)}), 500
@@ -578,38 +404,27 @@ def get_logs():
 def create_log():
     d = request.json
     try:
-        with engine.begin() as conn:
-            row = conn.execute(text("""
-                INSERT INTO strategy_logs (type, title, text, links, date)
-                VALUES (:type, :title, :text, :links, :date)
-                RETURNING *
-            """), {
-                'type': d.get('type', 'Insight'),
-                'title': d.get('title', ''),
-                'text': d.get('text'),
-                'links': json.dumps(d.get('links', [])),
-                'date': d.get('date', datetime.now().strftime('%Y-%m-%d')),
-            }).fetchone()
-            
-            result = row_to_dict(row)
-            try:
-                result['links'] = json.loads(result['links'] or '[]')
-            except:
-                result['links'] = []
-            return jsonify(result), 201
+        now = datetime.utcnow()
+        log = {
+            'type':       d.get('type', 'Insight'),
+            'title':      d.get('title', ''),
+            'text':       d.get('text'),
+            'links':      d.get('links', []),   # stored as native array
+            'date':       d.get('date', datetime.now().strftime('%Y-%m-%d')),
+            'created_at': now,
+        }
+        result = db.strategy_logs.insert_one(log)
+        log['_id'] = result.inserted_id
+        return jsonify(doc(log)), 201
     except Exception as e:
         print(f"Error in create_log: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/logs/<int:lid>', methods=['DELETE'])
+@app.route('/api/logs/<string:lid>', methods=['DELETE'])
 def delete_log(lid):
     try:
-        with engine.begin() as conn:
-            conn.execute(
-                text("DELETE FROM strategy_logs WHERE id = :id"), 
-                {'id': lid}
-            )
-            return jsonify({'ok': True})
+        db.strategy_logs.delete_one({'_id': oid(lid)})
+        return jsonify({'ok': True})
     except Exception as e:
         print(f"Error in delete_log: {e}")
         return jsonify({'error': str(e)}), 500
@@ -621,25 +436,18 @@ def delete_log(lid):
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
     try:
-        with engine.connect() as conn:
-            queries = {
-                'contacts_total': "SELECT COUNT(*) FROM contacts",
-                'contacts_active': "SELECT COUNT(*) FROM contacts WHERE status != 'cerrado'",
-                'tasks_doing': "SELECT COUNT(*) FROM tasks WHERE status = 'doing'",
-                'tasks_todo': "SELECT COUNT(*) FROM tasks WHERE status = 'todo'",
-                'tasks_done': "SELECT COUNT(*) FROM tasks WHERE done = 1",
-                'tasks_total': "SELECT COUNT(*) FROM tasks",
-                'insights': "SELECT COUNT(*) FROM strategy_logs WHERE type = 'Insight'",
-                'logs_total': "SELECT COUNT(*) FROM strategy_logs",
-                'products_total': "SELECT COUNT(*) FROM products",
-                'products_active': "SELECT COUNT(*) FROM products WHERE status = 'activo'",
-            }
-            
-            result = {}
-            for k, v in queries.items():
-                result[k] = conn.execute(text(v)).scalar()
-            
-            return jsonify(result)
+        return jsonify({
+            'contacts_total':   db.contacts.count_documents({}),
+            'contacts_active':  db.contacts.count_documents({'status': {'$ne': 'cerrado'}}),
+            'tasks_doing':      db.tasks.count_documents({'status': 'doing'}),
+            'tasks_todo':       db.tasks.count_documents({'status': 'todo'}),
+            'tasks_done':       db.tasks.count_documents({'done': 1}),
+            'tasks_total':      db.tasks.count_documents({}),
+            'insights':         db.strategy_logs.count_documents({'type': 'Insight'}),
+            'logs_total':       db.strategy_logs.count_documents({}),
+            'products_total':   db.products.count_documents({}),
+            'products_active':  db.products.count_documents({'status': 'activo'}),
+        })
     except Exception as e:
         print(f"Error in get_stats: {e}")
         return jsonify({'error': str(e)}), 500
@@ -1761,7 +1569,7 @@ async function saveTask(){
   const name=document.getElementById('t-name').value.trim();if(!name){shake('t-name');return;}
   const id=document.getElementById('task-id').value;
   const pid=document.getElementById('t-product').value;
-  const data={product_id:parseInt(pid),module:v('t-module')||'Backend',name,description:v('t-desc'),
+  const data={product_id:pid,module:v('t-module')||'Backend',name,description:v('t-desc'),
     status:v('t-status'),priority:v('t-priority'),impact:v('t-impact'),done:v('t-status')==='done'?1:0};
   try{
     if(id){await api('/api/tasks/'+id,'PUT',data);toast('Task actualizada','success');}
@@ -1988,6 +1796,7 @@ def index():
     return HTML, 200, {'Content-Type': 'text/html; charset=utf-8'}
 
 if __name__ == '__main__':
-    print("\n  OpenAETH Command Core — Supabase / PostgreSQL")
+    print("\n  OpenAETH Command Core — MongoDB")
+    print(f"  DB: {MONGODB_DB}")
     print("  → http://localhost:5000\n")
     app.run(debug=False, host='0.0.0.0', port=5000)
