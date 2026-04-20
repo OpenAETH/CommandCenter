@@ -390,146 +390,267 @@ def get_stats():
         return jsonify({'error': str(e)}), 500
 
 # ============================================================================
-# GROQ CHATBOT — tool definitions
+# GROQ CHATBOT
+# ─────────────────────────────────────────────────────────────────────────────
+# Design principle: every tool is SELF-CONTAINED — no ID passing between rounds.
+# This eliminates the parallel-call race condition where the LLM calls
+# create_task with a hallucinated product_id before create_product returns.
+#
+# Tool catalogue:
+#   create_product_with_tasks  → atomic: product + N tasks in one shot
+#   add_tasks_to_product       → find product by name internally, then insert tasks
+#   list_products              → list all products
+#   list_tasks                 → list tasks (optionally filtered by product name)
+#   update_tasks               → bulk-update tasks by name + product name
 # ============================================================================
 
 GROQ_TOOLS = [
+    # ── 1. Create product + tasks atomically ──────────────────────────────────
+    {"type": "function", "function": {
+        "name": "create_product_with_tasks",
+        "description": (
+            "Crea un producto nuevo junto con todas sus tareas en UNA sola operación atómica. "
+            "Usá esta herramienta cuando el usuario quiera crear un producto y sus tareas a la vez. "
+            "No necesitás buscar product_id antes; esta herramienta lo hace internamente."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "product_name":        {"type": "string", "description": "Nombre del producto"},
+                "product_icon":        {"type": "string", "description": "Emoji, ej: 🚀"},
+                "product_description": {"type": "string"},
+                "product_status":      {"type": "string", "enum": ["activo","idea","pausado","archivado"]},
+                "product_color":       {"type": "string", "description": "Hex, ej: #00e5ff"},
+                "module":              {"type": "string", "description": "Módulo para todas las tasks, ej: Backend"},
+                "tasks": {
+                    "type": "array",
+                    "description": "Lista de tareas a crear dentro de este producto",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name":        {"type": "string"},
+                            "description": {"type": "string"},
+                            "priority":    {"type": "string", "enum": ["alto","medio","bajo"]},
+                            "impact":      {"type": "string", "enum": ["alto","medio","bajo"]},
+                            "status":      {"type": "string", "enum": ["todo","doing","done"]},
+                            "module":      {"type": "string", "description": "Override del módulo para esta task específica"},
+                        },
+                        "required": ["name"]
+                    }
+                }
+            },
+            "required": ["product_name", "tasks"]
+        }
+    }},
+
+    # ── 2. Add tasks to an EXISTING product (by name) ─────────────────────────
+    {"type": "function", "function": {
+        "name": "add_tasks_to_product",
+        "description": (
+            "Agrega tareas a un producto que YA EXISTE. "
+            "Busca el producto por nombre internamente (no necesitás product_id). "
+            "Usá esta herramienta cuando el producto ya existe y sólo hay que agregar tareas."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "product_name": {"type": "string", "description": "Nombre del producto (parcial, case-insensitive)"},
+                "module":       {"type": "string", "description": "Módulo por defecto para las tasks"},
+                "tasks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name":        {"type": "string"},
+                            "description": {"type": "string"},
+                            "priority":    {"type": "string", "enum": ["alto","medio","bajo"]},
+                            "impact":      {"type": "string", "enum": ["alto","medio","bajo"]},
+                            "status":      {"type": "string", "enum": ["todo","doing","done"]},
+                            "module":      {"type": "string"},
+                        },
+                        "required": ["name"]
+                    }
+                }
+            },
+            "required": ["product_name", "tasks"]
+        }
+    }},
+
+    # ── 3. List products ───────────────────────────────────────────────────────
     {"type": "function", "function": {
         "name": "list_products",
-        "description": "Lista todos los productos existentes en el sistema DEV.",
-        "parameters": {"type": "object", "properties": {}, "required": []},
+        "description": "Lista todos los productos con su id, nombre y estado.",
+        "parameters": {"type": "object", "properties": {}, "required": []}
     }},
-    {"type": "function", "function": {
-        "name": "find_product_by_name",
-        "description": "Busca un producto por nombre (parcial, case-insensitive). Usá esto antes de crear tasks para obtener el product_id.",
-        "parameters": {
-            "type": "object",
-            "properties": {"name": {"type": "string", "description": "Nombre parcial del producto"}},
-            "required": ["name"],
-        },
-    }},
-    {"type": "function", "function": {
-        "name": "create_product",
-        "description": "Crea un nuevo producto en el sistema DEV.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name":        {"type": "string"},
-                "icon":        {"type": "string", "description": "Emoji, ej: 🚀"},
-                "description": {"type": "string"},
-                "status":      {"type": "string", "enum": ["activo", "idea", "pausado", "archivado"]},
-                "color":       {"type": "string", "description": "Hex color, ej: #00e5ff"},
-            },
-            "required": ["name"],
-        },
-    }},
-    {"type": "function", "function": {
-        "name": "create_task",
-        "description": "Crea una tarea para un producto. Siempre buscá el product_id primero con find_product_by_name o list_products.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "product_id":  {"type": "string", "description": "ID MongoDB del producto (ObjectId string)"},
-                "module":      {"type": "string", "description": "Módulo: Backend, UI, Auth, etc. Default: General"},
-                "name":        {"type": "string"},
-                "description": {"type": "string"},
-                "status":      {"type": "string", "enum": ["todo", "doing", "done"]},
-                "priority":    {"type": "string", "enum": ["alto", "medio", "bajo"]},
-                "impact":      {"type": "string", "enum": ["alto", "medio", "bajo"]},
-            },
-            "required": ["product_id", "name"],
-        },
-    }},
+
+    # ── 4. List tasks ──────────────────────────────────────────────────────────
     {"type": "function", "function": {
         "name": "list_tasks",
-        "description": "Lista las tareas, opcionalmente filtradas por producto.",
+        "description": "Lista tareas. Si se pasa product_name, filtra por ese producto (búsqueda por nombre).",
         "parameters": {
             "type": "object",
             "properties": {
-                "product_id": {"type": "string", "description": "Filtrar por product_id (opcional)"},
-            },
-        },
+                "product_name": {"type": "string", "description": "Nombre del producto para filtrar (opcional)"}
+            }
+        }
     }},
+
+    # ── 5. Update tasks by name + product ─────────────────────────────────────
     {"type": "function", "function": {
-        "name": "update_task",
-        "description": "Actualiza una tarea existente.",
+        "name": "update_tasks",
+        "description": (
+            "Actualiza una o varias tareas buscándolas por nombre (parcial) y producto (nombre parcial). "
+            "No necesitás el ID de la task."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
-                "task_id":     {"type": "string"},
-                "name":        {"type": "string"},
-                "description": {"type": "string"},
-                "status":      {"type": "string", "enum": ["todo", "doing", "done"]},
-                "priority":    {"type": "string", "enum": ["alto", "medio", "bajo"]},
-                "impact":      {"type": "string", "enum": ["alto", "medio", "bajo"]},
-                "module":      {"type": "string"},
+                "product_name": {"type": "string", "description": "Nombre del producto (parcial)"},
+                "updates": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "task_name":   {"type": "string", "description": "Nombre parcial de la task a actualizar"},
+                            "status":      {"type": "string", "enum": ["todo","doing","done"]},
+                            "priority":    {"type": "string", "enum": ["alto","medio","bajo"]},
+                            "impact":      {"type": "string", "enum": ["alto","medio","bajo"]},
+                            "module":      {"type": "string"},
+                            "description": {"type": "string"},
+                        },
+                        "required": ["task_name"]
+                    }
+                }
             },
-            "required": ["task_id"],
-        },
+            "required": ["updates"]
+        }
     }},
 ]
 
-def execute_tool(name, args):
-    """Execute a Groq tool call and return JSON-serializable result."""
+
+def _insert_tasks(product_id_str: str, default_module: str, tasks: list) -> list:
+    """Insert a list of task dicts under the given product_id. Returns created task summaries."""
+    now = datetime.utcnow()
+    created = []
+    for t in tasks:
+        module = t.get("module") or default_module or "General"
+        status = t.get("status", "todo")
+        task_doc = {
+            "product_id":  product_id_str,
+            "module":      module,
+            "name":        t.get("name"),
+            "description": t.get("description", ""),
+            "status":      status,
+            "priority":    t.get("priority", "medio"),
+            "impact":      t.get("impact", "medio"),
+            "done":        1 if status == "done" else 0,
+            "created_at":  now,
+            "updated_at":  now,
+        }
+        result = db.tasks.insert_one(task_doc)
+        created.append({"id": str(result.inserted_id), "name": task_doc["name"]})
+    return created
+
+
+def execute_tool(name: str, args: dict):
+    """Execute a tool call. All tools are self-contained — no ID passing needed."""
     try:
-        if name == "list_products":
-            products = list(db.products.find().sort('sort_order', 1))
-            return [{"id": str(p["_id"]), "name": p["name"], "status": p.get("status")} for p in products]
-
-        elif name == "find_product_by_name":
-            q = args.get("name", "")
-            products = list(db.products.find({"name": {"$regex": q, "$options": "i"}}))
-            if not products:
-                return {"found": False, "message": f"No se encontró ningún producto con nombre '{q}'"}
-            return [{"id": str(p["_id"]), "name": p["name"]} for p in products]
-
-        elif name == "create_product":
+        # ── create_product_with_tasks ──────────────────────────────────────────
+        if name == "create_product_with_tasks":
             now = datetime.utcnow()
             product = {
-                "name": args.get("name"), "icon": args.get("icon", "📦"),
-                "description": args.get("description", ""),
-                "status": args.get("status", "activo"),
-                "color": args.get("color", "#00e5ff"),
-                "sort_order": db.products.count_documents({}) + 1,
-                "created_at": now, "updated_at": now,
+                "name":        args.get("product_name"),
+                "icon":        args.get("product_icon", "📦"),
+                "description": args.get("product_description", ""),
+                "status":      args.get("product_status", "activo"),
+                "color":       args.get("product_color", "#00e5ff"),
+                "sort_order":  db.products.count_documents({}) + 1,
+                "created_at":  now,
+                "updated_at":  now,
             }
-            result = db.products.insert_one(product)
-            return {"id": str(result.inserted_id), "name": product["name"], "created": True}
+            prod_result = db.products.insert_one(product)
+            product_id_str = str(prod_result.inserted_id)
 
-        elif name == "create_task":
-            now = datetime.utcnow()
-            task = {
-                "product_id": args.get("product_id"),
-                "module": args.get("module", "General"),
-                "name": args.get("name"),
-                "description": args.get("description", ""),
-                "status": args.get("status", "todo"),
-                "priority": args.get("priority", "medio"),
-                "impact": args.get("impact", "medio"),
-                "done": 0, "created_at": now, "updated_at": now,
+            tasks_raw = args.get("tasks", [])
+            default_module = args.get("module", "General")
+            created_tasks = _insert_tasks(product_id_str, default_module, tasks_raw)
+
+            return {
+                "product": {"id": product_id_str, "name": product["name"]},
+                "tasks_created": len(created_tasks),
+                "tasks": created_tasks,
             }
-            result = db.tasks.insert_one(task)
-            return {"id": str(result.inserted_id), "name": task["name"], "created": True}
 
+        # ── add_tasks_to_product ───────────────────────────────────────────────
+        elif name == "add_tasks_to_product":
+            q = args.get("product_name", "")
+            product = db.products.find_one({"name": {"$regex": q, "$options": "i"}})
+            if not product:
+                return {"error": f"No se encontró el producto '{q}'. Verificá el nombre o crealo primero."}
+            product_id_str = str(product["_id"])
+
+            tasks_raw = args.get("tasks", [])
+            default_module = args.get("module", "General")
+            created_tasks = _insert_tasks(product_id_str, default_module, tasks_raw)
+
+            return {
+                "product": {"id": product_id_str, "name": product["name"]},
+                "tasks_created": len(created_tasks),
+                "tasks": created_tasks,
+            }
+
+        # ── list_products ──────────────────────────────────────────────────────
+        elif name == "list_products":
+            products = list(db.products.find().sort("sort_order", 1))
+            return [{"id": str(p["_id"]), "name": p["name"], "status": p.get("status", "")} for p in products]
+
+        # ── list_tasks ─────────────────────────────────────────────────────────
         elif name == "list_tasks":
+            q = args.get("product_name", "")
             query = {}
-            if args.get("product_id"):
-                query["product_id"] = args["product_id"]
-            tasks = list(db.tasks.find(query).limit(50))
-            return [{"id": str(t["_id"]), "name": t["name"],
-                     "status": t.get("status"), "product_id": t.get("product_id")} for t in tasks]
+            if q:
+                product = db.products.find_one({"name": {"$regex": q, "$options": "i"}})
+                if product:
+                    query["product_id"] = str(product["_id"])
+            tasks = list(db.tasks.find(query).limit(60))
+            return [{
+                "id": str(t["_id"]), "name": t["name"],
+                "status": t.get("status"), "module": t.get("module"),
+                "priority": t.get("priority"),
+            } for t in tasks]
 
-        elif name == "update_task":
-            task_id = args.pop("task_id")
-            update = {k: v for k, v in args.items() if v is not None}
-            if update.get("status") == "done":
-                update["done"] = 1
-            update["updated_at"] = datetime.utcnow()
-            result = db.tasks.find_one_and_update(
-                {"_id": ObjectId(task_id)}, {"$set": update}, return_document=True)
-            return {"updated": True, "name": result.get("name") if result else None}
+        # ── update_tasks ───────────────────────────────────────────────────────
+        elif name == "update_tasks":
+            q_prod = args.get("product_name", "")
+            product_id_str = None
+            if q_prod:
+                product = db.products.find_one({"name": {"$regex": q_prod, "$options": "i"}})
+                if product:
+                    product_id_str = str(product["_id"])
+
+            results = []
+            for upd in args.get("updates", []):
+                task_name = upd.pop("task_name", "")
+                query = {"name": {"$regex": task_name, "$options": "i"}}
+                if product_id_str:
+                    query["product_id"] = product_id_str
+                fields = {k: v for k, v in upd.items() if v is not None}
+                if fields.get("status") == "done":
+                    fields["done"] = 1
+                elif "status" in fields:
+                    fields["done"] = 0
+                fields["updated_at"] = datetime.utcnow()
+                res = db.tasks.find_one_and_update(
+                    query, {"$set": fields}, return_document=True)
+                results.append({
+                    "task": task_name,
+                    "updated": bool(res),
+                    "name": res.get("name") if res else None,
+                })
+            return {"results": results}
 
         return {"error": f"Herramienta desconocida: {name}"}
+
     except Exception as e:
         return {"error": str(e)}
 
@@ -537,7 +658,9 @@ def execute_tool(name, args):
 @app.route('/api/chat', methods=['POST'])
 def chat():
     if not groq_client:
-        msg = 'Chatbot no disponible: ' + ('configurá GROQ_API_KEY.' if GroqClient else 'instalá la librería groq.')
+        msg = ('Chatbot no disponible: configurá GROQ_API_KEY en Render.'
+               if GroqClient else
+               'Chatbot no disponible: instalá la librería groq (pip install groq).')
         return jsonify({'response': msg, 'refresh': False})
 
     data = request.json or {}
@@ -546,15 +669,21 @@ def chat():
     system_msg = {
         "role": "system",
         "content": (
-            "Sos el asistente IA del sistema OpenAETH CommandCenter. "
-            "Tu especialidad es gestionar el módulo DEV: productos y tareas. "
-            "Respondé siempre en español, sé conciso. "
-            "Cuando el usuario pida crear o buscar cosas, usá las herramientas disponibles. "
-            "Si el usuario menciona un producto por nombre, buscalo primero con find_product_by_name. "
-            "Confirmá siempre las acciones realizadas con un resumen claro."
+            "Sos el asistente IA de OpenAETH CommandCenter. Tu especialidad es gestionar "
+            "el módulo DEV: productos y tareas. Respondé siempre en español, sé conciso.\n\n"
+            "REGLAS DE USO DE HERRAMIENTAS:\n"
+            "1. Si el usuario quiere crear un producto Y sus tareas → usá create_product_with_tasks "
+            "   (una sola llamada, incluye todo).\n"
+            "2. Si el producto ya existe y hay que agregar tareas → usá add_tasks_to_product.\n"
+            "3. NUNCA llames create_product por separado y luego create_task; usá siempre los tools "
+            "   atómicos de arriba.\n"
+            "4. Para listar o actualizar, usá list_products / list_tasks / update_tasks.\n"
+            "5. Confirmá siempre con un resumen: qué producto, cuántas tasks, con qué nombres."
         )
     }
 
+    # Rebuild conversation history — include tool messages from this request only
+    # (client sends only user/assistant content turns)
     all_messages = [system_msg] + [
         {"role": m["role"], "content": m["content"]}
         for m in messages
@@ -563,7 +692,7 @@ def chat():
 
     did_tool_calls = False
 
-    for _ in range(10):   # max 10 tool-call rounds
+    for _ in range(8):
         try:
             response = groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
@@ -573,13 +702,13 @@ def chat():
                 max_tokens=1024,
             )
         except Exception as e:
-            return jsonify({'response': f'Error Groq: {str(e)}', 'refresh': False})
+            return jsonify({'response': f'Error Groq: {str(e)}', 'refresh': did_tool_calls})
 
         choice = response.choices[0]
         message = choice.message
         finish_reason = choice.finish_reason
 
-        # Build assistant message for history
+        # Append assistant message (with tool_calls if present)
         asst_msg = {"role": "assistant", "content": message.content or ""}
         if message.tool_calls:
             asst_msg["tool_calls"] = [
@@ -608,7 +737,10 @@ def chat():
                 "refresh": did_tool_calls
             })
 
-    return jsonify({"response": "No pude completar la operación en los pasos permitidos.", "refresh": did_tool_calls})
+    return jsonify({
+        "response": "No pude completar la operación en los pasos permitidos.",
+        "refresh": did_tool_calls
+    })
 
 # ============================================================================
 # FRONTEND
