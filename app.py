@@ -227,74 +227,79 @@ def delete_task(tid):
 # CAMPAÑA — DASHBOARD DE LA DESARROLLADORA (datos derivados del módulo DEV)
 # ============================================================================
 
+def compute_dev_metrics():
+    """Métricas agregadas del módulo DEV. Compartido por el endpoint /api/dev-metrics
+    y el tool get_dev_metrics del asistente. Todo se deriva de products + tasks."""
+    products = list(db.products.find())
+    tasks = list(db.tasks.find())
+
+    # Conteo por estado (normalizado a todo/doing/done)
+    by_status = {'todo': 0, 'doing': 0, 'done': 0}
+    for t in tasks:
+        st = 'done' if t.get('done') else t.get('status', 'todo')
+        by_status[st if st in by_status else 'todo'] += 1
+
+    total = len(tasks)
+    done_n = by_status['done']
+    pct = round(done_n / total * 100) if total else 0
+
+    # Completadas por día — últimos 7 días (incluye hoy)
+    today = datetime.utcnow().date()
+    week = [today - timedelta(days=i) for i in range(6, -1, -1)]
+    week_counts = {d.isoformat(): 0 for d in week}
+    for t in tasks:
+        if not t.get('done'):
+            continue
+        # completed_at es el camino principal; updated_at como fallback robusto
+        ts = t.get('completed_at') or t.get('updated_at')
+        if not ts:
+            continue
+        d = ts.date() if hasattr(ts, 'date') else None
+        if d and d.isoformat() in week_counts:
+            week_counts[d.isoformat()] += 1
+    weekly = [
+        {'date': d.isoformat(),
+         'label': d.strftime('%a'),
+         'count': week_counts[d.isoformat()]}
+        for d in week
+    ]
+
+    # Progreso por producto
+    per_product = []
+    for p in products:
+        pid = str(p['_id'])
+        ptasks = [t for t in tasks if t.get('product_id') == pid]
+        pdone = sum(1 for t in ptasks if t.get('done'))
+        per_product.append({
+            'id': pid,
+            'name': p.get('name', ''),
+            'icon': p.get('icon', '📦'),
+            'color': p.get('color', '#00e5ff'),
+            'status': p.get('status', 'activo'),
+            'total': len(ptasks),
+            'done': pdone,
+            'pct': round(pdone / len(ptasks) * 100) if ptasks else 0,
+        })
+
+    return {
+        'products_total':  len(products),
+        'products_active': sum(1 for p in products if p.get('status') == 'activo'),
+        'tasks_total':     total,
+        'tasks_todo':      by_status['todo'],
+        'tasks_doing':     by_status['doing'],
+        'tasks_done':      done_n,
+        'pct_done':        pct,
+        'weekly_completed': weekly,
+        'week_total':      sum(week_counts.values()),
+        'per_product':     per_product,
+    }
+
+
 @app.route('/api/dev-metrics', methods=['GET'])
 def dev_metrics():
-    """Métricas agregadas del módulo DEV para el panel Campaña.
-    No hay datos manuales: todo se deriva de products + tasks."""
+    """Métricas agregadas del módulo DEV para el panel Campaña."""
     try:
-        products = list(db.products.find())
-        tasks = list(db.tasks.find())
-
-        # Conteo por estado (normalizado a todo/doing/done)
-        by_status = {'todo': 0, 'doing': 0, 'done': 0}
-        for t in tasks:
-            st = 'done' if t.get('done') else t.get('status', 'todo')
-            by_status[st if st in by_status else 'todo'] += 1
-
-        total = len(tasks)
-        done_n = by_status['done']
-        pct = round(done_n / total * 100) if total else 0
-
-        # Completadas por día — últimos 7 días (incluye hoy)
-        today = datetime.utcnow().date()
-        week = [today - timedelta(days=i) for i in range(6, -1, -1)]
-        week_counts = {d.isoformat(): 0 for d in week}
-        for t in tasks:
-            if not t.get('done'):
-                continue
-            # completed_at es el camino principal; updated_at como fallback robusto
-            ts = t.get('completed_at') or t.get('updated_at')
-            if not ts:
-                continue
-            d = ts.date() if hasattr(ts, 'date') else None
-            if d and d.isoformat() in week_counts:
-                week_counts[d.isoformat()] += 1
-        weekly = [
-            {'date': d.isoformat(),
-             'label': d.strftime('%a'),
-             'count': week_counts[d.isoformat()]}
-            for d in week
-        ]
-
-        # Progreso por producto
-        per_product = []
-        for p in products:
-            pid = str(p['_id'])
-            ptasks = [t for t in tasks if t.get('product_id') == pid]
-            pdone = sum(1 for t in ptasks if t.get('done'))
-            per_product.append({
-                'id': pid,
-                'name': p.get('name', ''),
-                'icon': p.get('icon', '📦'),
-                'color': p.get('color', '#00e5ff'),
-                'status': p.get('status', 'activo'),
-                'total': len(ptasks),
-                'done': pdone,
-                'pct': round(pdone / len(ptasks) * 100) if ptasks else 0,
-            })
-
-        return jsonify({
-            'products_total':  len(products),
-            'products_active': sum(1 for p in products if p.get('status') == 'activo'),
-            'tasks_total':     total,
-            'tasks_todo':      by_status['todo'],
-            'tasks_doing':     by_status['doing'],
-            'tasks_done':      done_n,
-            'pct_done':        pct,
-            'weekly_completed': weekly,
-            'week_total':      sum(week_counts.values()),
-            'per_product':     per_product,
-        })
+        return jsonify(compute_dev_metrics())
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -498,6 +503,112 @@ GROQ_TOOLS = [
             "required": ["updates"]
         }
     }},
+
+    # ── 6. Update product (by name) ───────────────────────────────────────────
+    {"type": "function", "function": {
+        "name": "update_product",
+        "description": (
+            "Modifica un producto existente buscándolo por nombre (parcial). "
+            "Sólo cambia los campos que se pasen. No necesitás el ID."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "product_name": {"type": "string", "description": "Nombre actual del producto (parcial)"},
+                "new_name":     {"type": "string", "description": "Nuevo nombre (opcional)"},
+                "icon":         {"type": "string"},
+                "description":  {"type": "string"},
+                "status":       {"type": "string", "enum": ["activo","idea","pausado","archivado"]},
+                "color":        {"type": "string", "description": "Hex, ej: #00e5ff"},
+            },
+            "required": ["product_name"]
+        }
+    }},
+
+    # ── 7. Move tasks to another product/module ───────────────────────────────
+    {"type": "function", "function": {
+        "name": "move_tasks",
+        "description": (
+            "Mueve tareas a otro producto y/o cambia su módulo. "
+            "Busca tareas por nombre (parcial) dentro del producto origen."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "from_product":   {"type": "string", "description": "Producto origen (parcial). Opcional si los nombres de task son únicos."},
+                "to_product":     {"type": "string", "description": "Producto destino (parcial)."},
+                "new_module":     {"type": "string", "description": "Nuevo módulo para las tareas movidas (opcional)."},
+                "task_names":     {"type": "array", "items": {"type": "string"},
+                                   "description": "Nombres (parciales) de las tareas a mover."},
+            },
+            "required": ["to_product", "task_names"]
+        }
+    }},
+
+    # ── 8. Delete tasks (by name + product) ───────────────────────────────────
+    {"type": "function", "function": {
+        "name": "delete_tasks",
+        "description": (
+            "Elimina una o varias tareas buscándolas por nombre (parcial) y producto (parcial). "
+            "Acción destructiva: usala sólo cuando el usuario lo pida explícitamente."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "product_name": {"type": "string", "description": "Producto (parcial), para acotar la búsqueda."},
+                "task_names":   {"type": "array", "items": {"type": "string"},
+                                 "description": "Nombres (parciales) de las tareas a eliminar."},
+            },
+            "required": ["task_names"]
+        }
+    }},
+
+    # ── 9. Delete product (and its tasks) ─────────────────────────────────────
+    {"type": "function", "function": {
+        "name": "delete_product",
+        "description": (
+            "Elimina un producto y TODAS sus tareas. Acción destructiva: "
+            "usala sólo cuando el usuario lo pida explícitamente y sin ambigüedad."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "product_name": {"type": "string", "description": "Nombre del producto (parcial)."},
+            },
+            "required": ["product_name"]
+        }
+    }},
+
+    # ── 10. Get dev metrics (developer dashboard) ─────────────────────────────
+    {"type": "function", "function": {
+        "name": "get_dev_metrics",
+        "description": (
+            "Devuelve métricas agregadas de la desarrolladora: cantidad de productos, "
+            "tareas por estado (todo/doing/done), % completado, completadas esta semana "
+            "y progreso por producto. Usalo para responder preguntas de avance o reportes."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []}
+    }},
+
+    # ── 11. Create strategy log ───────────────────────────────────────────────
+    {"type": "function", "function": {
+        "name": "create_log",
+        "description": (
+            "Registra una entrada en Estrategia: una decisión, insight, riesgo u oportunidad "
+            "que surja de la conversación. Útil para capturar aprendizajes."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "type":  {"type": "string", "enum": ["Decision","Insight","Riesgo","Oportunidad"]},
+                "title": {"type": "string", "description": "Título breve."},
+                "text":  {"type": "string", "description": "Contenido del log con contexto suficiente."},
+                "links": {"type": "array", "items": {"type": "string"},
+                          "description": "Conexiones opcionales, ej: 'DEV→Backend'."},
+            },
+            "required": ["type", "text"]
+        }
+    }},
 ]
 
 
@@ -621,6 +732,119 @@ def execute_tool(name: str, args: dict):
                 })
             return {"results": results}
 
+        # ── update_product ─────────────────────────────────────────────────────
+        elif name == "update_product":
+            q = args.get("product_name", "")
+            product = db.products.find_one({"name": {"$regex": q, "$options": "i"}})
+            if not product:
+                return {"error": f"No se encontró el producto '{q}'."}
+            fields = {}
+            if args.get("new_name"):    fields["name"] = args["new_name"]
+            if args.get("icon"):        fields["icon"] = args["icon"]
+            if args.get("description") is not None: fields["description"] = args["description"]
+            if args.get("status"):      fields["status"] = args["status"]
+            if args.get("color"):       fields["color"] = args["color"]
+            if not fields:
+                return {"error": "No se especificó ningún cambio."}
+            fields["updated_at"] = datetime.utcnow()
+            res = db.products.find_one_and_update(
+                {"_id": product["_id"]}, {"$set": fields}, return_document=True)
+            return {"updated": True, "product": res.get("name"),
+                    "changed": [k for k in fields if k != "updated_at"]}
+
+        # ── move_tasks ─────────────────────────────────────────────────────────
+        elif name == "move_tasks":
+            dest = db.products.find_one({"name": {"$regex": args.get("to_product", ""), "$options": "i"}})
+            if not dest:
+                return {"error": f"No se encontró el producto destino '{args.get('to_product','')}'."}
+            dest_id = str(dest["_id"])
+            from_id = None
+            if args.get("from_product"):
+                src = db.products.find_one({"name": {"$regex": args["from_product"], "$options": "i"}})
+                if src:
+                    from_id = str(src["_id"])
+            new_module = args.get("new_module")
+            now = datetime.utcnow()
+            results = []
+            for tn in args.get("task_names", []):
+                query = {"name": {"$regex": tn, "$options": "i"}}
+                if from_id:
+                    query["product_id"] = from_id
+                fields = {"product_id": dest_id, "updated_at": now}
+                if new_module:
+                    fields["module"] = new_module
+                res = db.tasks.find_one_and_update(
+                    query, {"$set": fields}, return_document=True)
+                results.append({"task": tn, "moved": bool(res),
+                                "name": res.get("name") if res else None})
+            return {"to_product": dest.get("name"), "new_module": new_module, "results": results}
+
+        # ── delete_tasks ───────────────────────────────────────────────────────
+        elif name == "delete_tasks":
+            product_id_str = None
+            if args.get("product_name"):
+                product = db.products.find_one({"name": {"$regex": args["product_name"], "$options": "i"}})
+                if product:
+                    product_id_str = str(product["_id"])
+            results = []
+            for tn in args.get("task_names", []):
+                query = {"name": {"$regex": tn, "$options": "i"}}
+                if product_id_str:
+                    query["product_id"] = product_id_str
+                target = db.tasks.find_one(query)
+                if target:
+                    db.tasks.delete_one({"_id": target["_id"]})
+                    results.append({"task": tn, "deleted": True, "name": target.get("name")})
+                else:
+                    results.append({"task": tn, "deleted": False})
+            return {"results": results}
+
+        # ── delete_product ─────────────────────────────────────────────────────
+        elif name == "delete_product":
+            q = args.get("product_name", "")
+            product = db.products.find_one({"name": {"$regex": q, "$options": "i"}})
+            if not product:
+                return {"error": f"No se encontró el producto '{q}'."}
+            pid = str(product["_id"])
+            tasks_deleted = db.tasks.delete_many({"product_id": pid}).deleted_count
+            db.products.delete_one({"_id": product["_id"]})
+            return {"deleted": True, "product": product.get("name"),
+                    "tasks_deleted": tasks_deleted}
+
+        # ── get_dev_metrics ────────────────────────────────────────────────────
+        elif name == "get_dev_metrics":
+            m = compute_dev_metrics()
+            # Resumen compacto para el LLM (sin el detalle diario verboso)
+            return {
+                "products_total": m["products_total"],
+                "products_active": m["products_active"],
+                "tasks_total": m["tasks_total"],
+                "tasks_todo": m["tasks_todo"],
+                "tasks_doing": m["tasks_doing"],
+                "tasks_done": m["tasks_done"],
+                "pct_done": m["pct_done"],
+                "completed_this_week": m["week_total"],
+                "per_product": [
+                    {"name": p["name"], "done": p["done"], "total": p["total"], "pct": p["pct"]}
+                    for p in m["per_product"]
+                ],
+            }
+
+        # ── create_log ─────────────────────────────────────────────────────────
+        elif name == "create_log":
+            now = datetime.utcnow()
+            log = {
+                "type":  args.get("type", "Insight"),
+                "title": args.get("title", ""),
+                "text":  args.get("text", ""),
+                "links": args.get("links", []),
+                "date":  datetime.now().strftime("%Y-%m-%d"),
+                "created_at": now,
+            }
+            result = db.strategy_logs.insert_one(log)
+            return {"created": True, "id": str(result.inserted_id),
+                    "type": log["type"], "title": log["title"]}
+
         return {"error": f"Herramienta desconocida: {name}"}
 
     except Exception as e:
@@ -641,16 +865,25 @@ def chat():
     system_msg = {
         "role": "system",
         "content": (
-            "Sos el asistente IA de OpenAETH CommandCenter. Tu especialidad es gestionar "
-            "el módulo DEV: productos y tareas. Respondé siempre en español, sé conciso.\n\n"
-            "REGLAS DE USO DE HERRAMIENTAS:\n"
-            "1. Si el usuario quiere crear un producto Y sus tareas → usá create_product_with_tasks "
-            "   (una sola llamada, incluye todo).\n"
-            "2. Si el producto ya existe y hay que agregar tareas → usá add_tasks_to_product.\n"
-            "3. NUNCA llames create_product por separado y luego create_task; usá siempre los tools "
-            "   atómicos de arriba.\n"
-            "4. Para listar o actualizar, usá list_products / list_tasks / update_tasks.\n"
-            "5. Confirmá siempre con un resumen: qué producto, cuántas tasks, con qué nombres."
+            "Sos AETHY, el asistente IA de OpenAETH CommandCenter. Gestionás el módulo DEV "
+            "(productos y tareas) y respondés preguntas sobre el avance de la desarrolladora. "
+            "Respondé siempre en español, en tono claro y conciso.\n\n"
+            "HERRAMIENTAS DISPONIBLES:\n"
+            "• Crear: create_product_with_tasks (producto + sus tareas en una sola llamada), "
+            "add_tasks_to_product (tareas a un producto existente).\n"
+            "• Modificar: update_product (nombre/estado/ícono/color), update_tasks (estado, "
+            "prioridad, impacto, etc.), move_tasks (mover tareas a otro producto/módulo).\n"
+            "• Eliminar: delete_tasks, delete_product (destructivas).\n"
+            "• Consultar: list_products, list_tasks, get_dev_metrics (avance, % completado, "
+            "tareas por estado, esta semana, progreso por producto).\n"
+            "• Estrategia: create_log (registrar decisión/insight/riesgo/oportunidad).\n\n"
+            "REGLAS:\n"
+            "1. Para crear producto + tareas usá SIEMPRE create_product_with_tasks (nunca por separado).\n"
+            "2. Buscás productos y tareas por nombre; no inventes IDs.\n"
+            "3. Para preguntas de avance/estado/reportes usá get_dev_metrics, no adivines números.\n"
+            "4. Las acciones destructivas (delete_*) sólo si el usuario lo pide explícitamente; "
+            "si hay ambigüedad, preguntá antes.\n"
+            "5. Confirmá siempre con un resumen breve de lo que hiciste."
         )
     }
 
@@ -1282,19 +1515,19 @@ input,select,textarea{font-family:inherit;}
           </div>
         </div>
 
-        <!-- ASISTENTE IA card -->
+        <!-- AETHY card -->
         <div class="guide-card">
           <div class="guide-card-head">
             <div class="guide-card-icon">🤖</div>
-            <div><div class="guide-card-title" style="color:var(--purple-light)">ASISTENTE IA</div><div class="guide-card-sub">Groq · Qwen3-32B · gestión por chat</div></div>
+            <div><div class="guide-card-title" style="color:var(--purple-light)">AETHY</div><div class="guide-card-sub">Asistente IA · Qwen3-32B · gestión por chat</div></div>
           </div>
           <div class="guide-steps">
-            <div class="guide-step"><div class="gsn hl">1</div><div><div class="gs-title">Abrí el chat</div><div class="gs-desc">Botón 🤖 abajo a la derecha. Pedile en lenguaje natural lo que necesitás cargar o actualizar.</div></div></div>
-            <div class="guide-step"><div class="gsn">2</div><div><div class="gs-title">Crear producto + tasks</div><div class="gs-desc"><em>"Cargá el producto X y creá las tareas A, B, C"</em> — lo hace en una sola operación atómica.</div></div></div>
-            <div class="guide-step"><div class="gsn">3</div><div><div class="gs-title">Agregar y actualizar</div><div class="gs-desc"><em>"Agregá estas tareas a X"</em>, <em>"marcá la task Y como done"</em>. Busca por nombre, sin IDs.</div></div></div>
-            <div class="guide-step"><div class="gsn">4</div><div><div class="gs-title">Consultar estado</div><div class="gs-desc"><em>"listá los productos"</em>, <em>"qué tasks tiene X"</em>. El panel DEV se refresca solo.</div></div></div>
+            <div class="guide-step"><div class="gsn hl">1</div><div><div class="gs-title">Crear</div><div class="gs-desc"><em>"Cargá el producto X con las tareas A, B, C"</em> — producto + tareas en una sola operación.</div></div></div>
+            <div class="guide-step"><div class="gsn">2</div><div><div class="gs-title">Modificar y mover</div><div class="gs-desc"><em>"marcá Y como done"</em>, <em>"poné X en pausado"</em>, <em>"mové la task Z a otro producto"</em>. Por nombre, sin IDs.</div></div></div>
+            <div class="guide-step"><div class="gsn">3</div><div><div class="gs-title">Consultar avance</div><div class="gs-desc"><em>"¿cómo viene el avance?"</em>, <em>"qué tasks tiene X"</em>. Reporta % completado y estados reales.</div></div></div>
+            <div class="guide-step"><div class="gsn">4</div><div><div class="gs-title">Eliminar y registrar</div><div class="gs-desc"><em>"borrá la task W"</em>, <em>"registrá esta decisión en Estrategia"</em>. Lo destructivo lo confirma antes.</div></div></div>
           </div>
-          <div class="guide-tip"><strong>Tip:</strong> La IA es el camino rápido para poblar el backlog; el panel DEV queda para ajustes finos.</div>
+          <div class="guide-tip"><strong>Tip:</strong> AETHY busca todo por nombre. Los paneles DEV y Campaña se refrescan solos tras cada acción.</div>
         </div>
 
         <!-- DEV card -->
@@ -1896,7 +2129,7 @@ function toggleChat(){
   fab.classList.toggle('open',chatOpen);
   fab.textContent=chatOpen?'✕':'🤖';
   if(chatOpen&&chatHistory.length===0){
-    appendMsg('bot','De su orden. ¿Qué necesitás cargar o actualizar en el sistema? Podés decirme algo como:<br><em>"Cargá el producto X y creá las tareas A, B, C"</em>');
+    appendMsg('bot','Soy AETHY. Puedo crear y modificar productos y tareas, moverlas, eliminarlas y darte el avance de la desarrolladora. Probá:<br><em>"Cargá el producto X con las tareas A, B, C"</em> · <em>"¿cómo viene el avance?"</em>');
   }
   document.getElementById('chat-messages').scrollTop=9999;
 }
@@ -1970,13 +2203,13 @@ boot();
 </script>
 
 <!-- ══ CHATBOT WIDGET ══ -->
-<button class="chat-fab" id="chat-fab" onclick="toggleChat()" title="Asistente IA">🤖</button>
+<button class="chat-fab" id="chat-fab" onclick="toggleChat()" title="AETHY · Asistente IA">🤖</button>
 <div class="chat-panel" id="chat-panel">
   <div class="chat-head">
     <div class="chat-head-icon">🤖</div>
     <div class="chat-head-info">
-      <div class="chat-head-title">Asistente IA</div>
-      <div class="chat-head-sub">Groq · De su orden</div>
+      <div class="chat-head-title">AETHY</div>
+      <div class="chat-head-sub">Asistente IA · Qwen3-32B</div>
     </div>
     <div class="chat-online"></div>
   </div>
