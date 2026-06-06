@@ -3,7 +3,7 @@ from flask_cors import CORS
 from pymongo import MongoClient
 from pymongo.server_api import ServerApi
 from bson import ObjectId
-from datetime import datetime
+from datetime import datetime, timedelta
 import os, json, re, certifi
 
 try:
@@ -60,6 +60,18 @@ def strip_think(text):
     if not text:
         return text
     return _THINK_RE.sub('', text).strip()
+
+def apply_completion(update, status, now):
+    """Mantiene done y completed_at coherentes con el status.
+    Setea completed_at al pasar a 'done'; lo limpia al salir de 'done'.
+    Muta y devuelve el dict `update`."""
+    if status == 'done':
+        update['done'] = 1
+        update['completed_at'] = now
+    else:
+        update['done'] = 0
+        update['completed_at'] = None
+    return update
 
 # ============================================================================
 # HEALTH
@@ -149,15 +161,16 @@ def create_task():
     d = request.json
     try:
         now = datetime.utcnow()
+        status = d.get('status', 'todo')
         task = {
             'product_id': d.get('product_id'),
             'module': d.get('module', 'Backend'),
             'name': d.get('name'), 'description': d.get('description', ''),
-            'status': d.get('status', 'todo'), 'priority': d.get('priority', 'medio'),
+            'status': status, 'priority': d.get('priority', 'medio'),
             'impact': d.get('impact', 'medio'),
-            'done': 1 if d.get('status') == 'done' else 0,
             'created_at': now, 'updated_at': now,
         }
+        apply_completion(task, status, now)
         result = db.tasks.insert_one(task)
         task['_id'] = result.inserted_id
         return jsonify(doc(task)), 201
@@ -168,14 +181,16 @@ def create_task():
 def update_task(tid):
     d = request.json
     try:
-        done = 1 if (d.get('done') or d.get('status') == 'done') else 0
+        now = datetime.utcnow()
+        status = 'done' if d.get('done') else d.get('status', 'todo')
         update = {
             'product_id': d.get('product_id'), 'module': d.get('module', 'Backend'),
             'name': d.get('name'), 'description': d.get('description', ''),
-            'status': d.get('status', 'todo'), 'priority': d.get('priority', 'medio'),
-            'impact': d.get('impact', 'medio'), 'done': done,
-            'updated_at': datetime.utcnow(),
+            'status': status, 'priority': d.get('priority', 'medio'),
+            'impact': d.get('impact', 'medio'),
+            'updated_at': now,
         }
+        apply_completion(update, status, now)
         result = db.tasks.find_one_and_update(
             {'_id': oid(tid)}, {'$set': update}, return_document=True)
         if not result:
@@ -190,12 +205,12 @@ def toggle_task(tid):
         current = db.tasks.find_one({'_id': oid(tid)})
         if not current:
             return jsonify({'error': 'Task not found'}), 404
-        new_done = 0 if current.get('done') else 1
-        new_status = 'done' if new_done else 'doing'
+        now = datetime.utcnow()
+        new_status = 'doing' if current.get('done') else 'done'
+        update = {'status': new_status, 'updated_at': now}
+        apply_completion(update, new_status, now)
         result = db.tasks.find_one_and_update(
-            {'_id': oid(tid)},
-            {'$set': {'done': new_done, 'status': new_status, 'updated_at': datetime.utcnow()}},
-            return_document=True)
+            {'_id': oid(tid)}, {'$set': update}, return_document=True)
         return jsonify(doc(result))
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -209,56 +224,77 @@ def delete_task(tid):
         return jsonify({'error': str(e)}), 500
 
 # ============================================================================
-# CAMPAIGNS
+# CAMPAÑA — DASHBOARD DE LA DESARROLLADORA (datos derivados del módulo DEV)
 # ============================================================================
 
-@app.route('/api/campaigns', methods=['GET'])
-def get_campaigns():
+@app.route('/api/dev-metrics', methods=['GET'])
+def dev_metrics():
+    """Métricas agregadas del módulo DEV para el panel Campaña.
+    No hay datos manuales: todo se deriva de products + tasks."""
     try:
-        return jsonify([doc(r) for r in db.campaigns.find().sort('_id', 1)])
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        products = list(db.products.find())
+        tasks = list(db.tasks.find())
 
-@app.route('/api/campaigns', methods=['POST'])
-def create_campaign():
-    d = request.json
-    try:
-        now = datetime.utcnow()
-        campaign = {
-            'name': d.get('name'), 'icon': d.get('icon', '📊'),
-            'visitas': d.get('visitas', 0), 'conversion': d.get('conversion', 0),
-            'leads': d.get('leads', 0), 'backers': d.get('backers', 0),
-            'notes': d.get('notes', ''), 'created_at': now, 'updated_at': now,
-        }
-        result = db.campaigns.insert_one(campaign)
-        campaign['_id'] = result.inserted_id
-        return jsonify(doc(campaign)), 201
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        # Conteo por estado (normalizado a todo/doing/done)
+        by_status = {'todo': 0, 'doing': 0, 'done': 0}
+        for t in tasks:
+            st = 'done' if t.get('done') else t.get('status', 'todo')
+            by_status[st if st in by_status else 'todo'] += 1
 
-@app.route('/api/campaigns/<string:cid>', methods=['PUT'])
-def update_campaign(cid):
-    d = request.json
-    try:
-        update = {
-            'name': d.get('name'), 'icon': d.get('icon', '📊'),
-            'visitas': d.get('visitas', 0), 'conversion': d.get('conversion', 0),
-            'leads': d.get('leads', 0), 'backers': d.get('backers', 0),
-            'notes': d.get('notes', ''), 'updated_at': datetime.utcnow(),
-        }
-        result = db.campaigns.find_one_and_update(
-            {'_id': oid(cid)}, {'$set': update}, return_document=True)
-        if not result:
-            return jsonify({'error': 'Campaign not found'}), 404
-        return jsonify(doc(result))
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        total = len(tasks)
+        done_n = by_status['done']
+        pct = round(done_n / total * 100) if total else 0
 
-@app.route('/api/campaigns/<string:cid>', methods=['DELETE'])
-def delete_campaign(cid):
-    try:
-        db.campaigns.delete_one({'_id': oid(cid)})
-        return jsonify({'ok': True})
+        # Completadas por día — últimos 7 días (incluye hoy)
+        today = datetime.utcnow().date()
+        week = [today - timedelta(days=i) for i in range(6, -1, -1)]
+        week_counts = {d.isoformat(): 0 for d in week}
+        for t in tasks:
+            if not t.get('done'):
+                continue
+            # completed_at es el camino principal; updated_at como fallback robusto
+            ts = t.get('completed_at') or t.get('updated_at')
+            if not ts:
+                continue
+            d = ts.date() if hasattr(ts, 'date') else None
+            if d and d.isoformat() in week_counts:
+                week_counts[d.isoformat()] += 1
+        weekly = [
+            {'date': d.isoformat(),
+             'label': d.strftime('%a'),
+             'count': week_counts[d.isoformat()]}
+            for d in week
+        ]
+
+        # Progreso por producto
+        per_product = []
+        for p in products:
+            pid = str(p['_id'])
+            ptasks = [t for t in tasks if t.get('product_id') == pid]
+            pdone = sum(1 for t in ptasks if t.get('done'))
+            per_product.append({
+                'id': pid,
+                'name': p.get('name', ''),
+                'icon': p.get('icon', '📦'),
+                'color': p.get('color', '#00e5ff'),
+                'status': p.get('status', 'activo'),
+                'total': len(ptasks),
+                'done': pdone,
+                'pct': round(pdone / len(ptasks) * 100) if ptasks else 0,
+            })
+
+        return jsonify({
+            'products_total':  len(products),
+            'products_active': sum(1 for p in products if p.get('status') == 'activo'),
+            'tasks_total':     total,
+            'tasks_todo':      by_status['todo'],
+            'tasks_doing':     by_status['doing'],
+            'tasks_done':      done_n,
+            'pct_done':        pct,
+            'weekly_completed': weekly,
+            'week_total':      sum(week_counts.values()),
+            'per_product':     per_product,
+        })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -480,10 +516,10 @@ def _insert_tasks(product_id_str: str, default_module: str, tasks: list) -> list
             "status":      status,
             "priority":    t.get("priority", "medio"),
             "impact":      t.get("impact", "medio"),
-            "done":        1 if status == "done" else 0,
             "created_at":  now,
             "updated_at":  now,
         }
+        apply_completion(task_doc, status, now)
         result = db.tasks.insert_one(task_doc)
         created.append({"id": str(result.inserted_id), "name": task_doc["name"]})
     return created
@@ -571,12 +607,11 @@ def execute_tool(name: str, args: dict):
                 query = {"name": {"$regex": task_name, "$options": "i"}}
                 if product_id_str:
                     query["product_id"] = product_id_str
+                now = datetime.utcnow()
                 fields = {k: v for k, v in upd.items() if v is not None}
-                if fields.get("status") == "done":
-                    fields["done"] = 1
-                elif "status" in fields:
-                    fields["done"] = 0
-                fields["updated_at"] = datetime.utcnow()
+                if "status" in fields:
+                    apply_completion(fields, fields["status"], now)
+                fields["updated_at"] = now
                 res = db.tasks.find_one_and_update(
                     query, {"$set": fields}, return_document=True)
                 results.append({
@@ -876,25 +911,19 @@ input,select,textarea{font-family:inherit;}
 .chart-box-title{font-size:9px;color:var(--text2);letter-spacing:.1em;text-transform:uppercase;margin-bottom:8px;}
 .chart-box canvas{max-height:120px;}
 .camp-cards-wrap{flex:1;overflow-y:auto;padding:12px 16px;display:flex;flex-direction:column;gap:8px;}
-.camp-card{background:var(--bg1);border:1px solid var(--border);border-radius:var(--r);overflow:hidden;flex-shrink:0;}
-.camp-card-header{display:flex;align-items:center;justify-content:space-between;
-  padding:10px 12px;background:var(--bg2);border-bottom:1px solid var(--border);}
-.camp-card-title{font-family:var(--sans);font-size:12px;font-weight:700;display:flex;align-items:center;gap:7px;}
-.camp-card-body{padding:12px;display:flex;flex-direction:column;gap:10px;}
-.camp-mg{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;}
-.cmi{background:var(--bg0);border:1px solid var(--border);border-radius:4px;padding:7px 8px;}
-.cmi label{display:block;font-size:8px;color:var(--text2);letter-spacing:.08em;text-transform:uppercase;margin-bottom:2px;}
-.cmi input{background:none;border:none;outline:none;font-family:var(--sans);font-size:17px;font-weight:800;width:100%;}
-.cmi input.c{color:var(--cyan);}
-.cmi input.o{color:var(--orange);}
-.cmi input.p{color:var(--purple-light);}
-.cmi input.g{color:var(--green);}
-.camp-notes-row{display:flex;gap:8px;align-items:flex-start;}
-.camp-notes-row textarea{flex:1;background:var(--bg0);border:1px solid var(--border);border-radius:4px;
-  color:var(--text0);font-size:10px;padding:7px;resize:none;outline:none;line-height:1.5;}
-.camp-notes-row textarea:focus{border-color:var(--border3);}
+.status-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;}
+.status-card{background:var(--bg1);border:1px solid var(--border);border-top:2px solid var(--border2);
+  border-radius:var(--r);padding:16px 14px;text-align:center;}
+.status-card.todo{border-top-color:var(--text2);}
+.status-card.doing{border-top-color:var(--orange);}
+.status-card.done{border-top-color:var(--green);}
+.status-val{font-family:var(--sans);font-size:30px;font-weight:800;line-height:1;}
+.status-card.todo .status-val{color:var(--text1);}
+.status-card.doing .status-val{color:var(--orange);}
+.status-card.done .status-val{color:var(--green);}
+.status-lbl{font-size:10px;color:var(--text2);letter-spacing:.06em;text-transform:uppercase;margin-top:8px;}
 
-/* right panel - canal detail */
+/* right panel - progreso por producto */
 .campaign-right{display:flex;flex-direction:column;overflow:hidden;background:var(--bg1);}
 .cr-head{padding:12px 14px;border-bottom:1px solid var(--border);font-size:10px;color:var(--text2);letter-spacing:.1em;text-transform:uppercase;flex-shrink:0;}
 .cr-body{flex:1;overflow-y:auto;padding:12px 14px;display:flex;flex-direction:column;gap:10px;}
@@ -1169,23 +1198,23 @@ input,select,textarea{font-family:inherit;}
     </div>
   </div>
 
-  <!-- CAMPAÑA -->
+  <!-- CAMPAÑA — Dashboard de la Desarrolladora -->
   <div class="panel" id="panel-campaign">
     <div class="panel-header">
-      <div class="panel-title" style="color:var(--purple-light)">🚀 CAMPAÑA <span class="panel-sub">— Growth & Marketing</span></div>
-      <div class="panel-actions"><button class="btn btn-primary" onclick="openCampaignModal()">+ Canal</button></div>
+      <div class="panel-title" style="color:var(--purple-light)">🚀 CAMPAÑA <span class="panel-sub">— Dashboard de la Desarrolladora · datos en vivo del módulo DEV</span></div>
+      <div class="panel-actions"><button class="btn" onclick="loadDevMetrics().then(renderCampaign)">↻ Actualizar</button></div>
     </div>
     <div class="campaign-layout">
       <div class="campaign-left">
         <div class="camp-metrics-bar" id="camp-metrics-bar"></div>
         <div class="camp-charts" id="camp-charts">
-          <div class="chart-box"><div class="chart-box-title">Leads por canal</div><canvas id="chart-leads"></canvas></div>
-          <div class="chart-box"><div class="chart-box-title">Conversión % por canal</div><canvas id="chart-conv"></canvas></div>
+          <div class="chart-box"><div class="chart-box-title">Tareas completadas · últimos 7 días</div><canvas id="chart-weekly"></canvas></div>
+          <div class="chart-box"><div class="chart-box-title">Distribución de tareas por estado</div><canvas id="chart-status"></canvas></div>
         </div>
         <div class="camp-cards-wrap" id="camp-cards-wrap"></div>
       </div>
       <div class="campaign-right">
-        <div class="cr-head">Canales · resumen</div>
+        <div class="cr-head">Productos · progreso</div>
         <div class="cr-body" id="camp-right-body"></div>
       </div>
     </div>
@@ -1287,15 +1316,15 @@ input,select,textarea{font-family:inherit;}
         <div class="guide-card">
           <div class="guide-card-head">
             <div class="guide-card-icon">🚀</div>
-            <div><div class="guide-card-title" style="color:var(--purple-light)">CAMPAÑA</div><div class="guide-card-sub">Canales · Métricas · Gráficos</div></div>
+            <div><div class="guide-card-title" style="color:var(--purple-light)">CAMPAÑA</div><div class="guide-card-sub">Dashboard de la Desarrolladora</div></div>
           </div>
           <div class="guide-steps">
-            <div class="guide-step"><div class="gsn hl">1</div><div><div class="gs-title">Crear canales</div><div class="gs-desc">+ Canal → nombre, ícono, notas. Visitas/leads/backers editables inline.</div></div></div>
-            <div class="guide-step"><div class="gsn">2</div><div><div class="gs-title">Ver gráficos</div><div class="gs-desc">Leads por canal y conversión % en gráficos de barra actualizados en tiempo real.</div></div></div>
-            <div class="guide-step"><div class="gsn">3</div><div><div class="gs-title">Panel lateral</div><div class="gs-desc">Resumen rápido de todos los canales con barra de performance de conversión.</div></div></div>
-            <div class="guide-step"><div class="gsn">4</div><div><div class="gs-title">Notas de iteración</div><div class="gs-desc">Cada canal tiene notas: qué probaste, qué funcionó, qué no. Guardá con 💾.</div></div></div>
+            <div class="guide-step"><div class="gsn hl">1</div><div><div class="gs-title">Datos en vivo de DEV</div><div class="gs-desc">No se carga nada a mano: todo se deriva de productos y tareas del módulo DEV.</div></div></div>
+            <div class="guide-step"><div class="gsn">2</div><div><div class="gs-title">Métricas y estados</div><div class="gs-desc">Proyectos, % completado, y tareas por estado: Por hacer / Haciendo / Hecho.</div></div></div>
+            <div class="guide-step"><div class="gsn">3</div><div><div class="gs-title">Gráfico semanal</div><div class="gs-desc">Tareas completadas en los últimos 7 días + distribución por estado.</div></div></div>
+            <div class="guide-step"><div class="gsn">4</div><div><div class="gs-title">Progreso por producto</div><div class="gs-desc">Panel lateral con el avance de cada producto. Se actualiza al entrar o con ↻.</div></div></div>
           </div>
-          <div class="guide-tip"><strong>Tip:</strong> Alta conv + pocas visitas = escalar. Muchas visitas + baja conv = mejorar el mensaje.</div>
+          <div class="guide-tip"><strong>Tip:</strong> Cargá y movés tareas desde DEV o por el asistente IA; Campaña refleja el pulso de la desarrolladora.</div>
         </div>
 
         <!-- ESTRATEGIA card -->
@@ -1427,24 +1456,6 @@ input,select,textarea{font-family:inherit;}
   </div>
 </div>
 
-<!-- MODAL CAMPAÑA -->
-<div class="overlay" id="modal-campaign" onclick="overlayClose(event,'modal-campaign')">
-  <div class="modal">
-    <div class="modal-head"><div class="modal-title">Nuevo Canal</div><button class="modal-close" onclick="closeModal('modal-campaign')">✕</button></div>
-    <div class="modal-body">
-      <div class="f-row">
-        <div class="f-group"><label class="f-label">Nombre *</label><input class="f-input" id="camp-name" placeholder="Landing, Redes, Email..."/></div>
-        <div class="f-group"><label class="f-label">Icono</label><input class="f-input" id="camp-icon" placeholder="📊" maxlength="4"/></div>
-      </div>
-      <div class="f-group"><label class="f-label">Notas</label><textarea class="f-textarea" id="camp-notes" placeholder="Objetivo, hipótesis..."></textarea></div>
-    </div>
-    <div class="modal-foot">
-      <span></span>
-      <div style="display:flex;gap:7px"><button class="btn" onclick="closeModal('modal-campaign')">Cancelar</button><button class="btn btn-primary" onclick="saveCampaign()">Crear canal</button></div>
-    </div>
-  </div>
-</div>
-
 <!-- MODAL LOG -->
 <div class="overlay" id="modal-log" onclick="overlayClose(event,'modal-log')">
   <div class="modal">
@@ -1470,11 +1481,10 @@ input,select,textarea{font-family:inherit;}
 
 <script>
 const API='';
-let STATE={tasks:[],campaigns:[],logs:[],stats:{},products:[]};
+let STATE={tasks:[],devMetrics:{},logs:[],stats:{},products:[]};
 let logFilter='';
 let modExp={Auth:true,Backend:true,UI:true,'Multi-IA':true};
-const campDirty={};
-let charts={leads:null,conv:null};
+let charts={weekly:null,status:null};
 
 const LOG_C={Decision:'#00e5ff',Insight:'#ffd700',Riesgo:'#ff3e5e',Oportunidad:'#39ff14'};
 const MODS=['Auth','Backend','UI','Multi-IA'];
@@ -1496,7 +1506,7 @@ async function api(path,method='GET',body=null){
 
 async function boot(){
   try{
-    await Promise.all([loadProducts(),loadTasks(),loadCampaigns(),loadLogs(),loadStats()]);
+    await Promise.all([loadProducts(),loadTasks(),loadDevMetrics(),loadLogs(),loadStats()]);
     const old=document.getElementById('boot-err');if(old)old.remove();
     render();
   }catch(e){
@@ -1516,7 +1526,7 @@ async function boot(){
 
 async function loadProducts(){STATE.products=await api('/api/products');}
 async function loadTasks(){STATE.tasks=await api('/api/tasks');}
-async function loadCampaigns(){STATE.campaigns=await api('/api/campaigns');}
+async function loadDevMetrics(){STATE.devMetrics=await api('/api/dev-metrics');}
 async function loadLogs(){STATE.logs=await api('/api/logs');}
 async function loadStats(){STATE.stats=await api('/api/stats');}
 function render(){renderDev();renderCampaign();renderStrategy();renderStats();}
@@ -1529,7 +1539,7 @@ function switchPanel(name,btnEl){
   (btnEl||document.querySelector('.nav-tab[data-panel="'+name+'"]'))?.classList.add('active');
   document.querySelectorAll('.sidebar-link').forEach(b=>b.classList.remove('active'));
   document.getElementById('sl-'+name)?.classList.add('active');
-  if(name==='campaign') setTimeout(renderCharts,50);
+  if(name==='campaign') loadDevMetrics().then(()=>renderCampaign()).catch(()=>renderCharts());
 }
 
 // stats
@@ -1736,106 +1746,81 @@ async function deleteProduct(){
   catch(e){toast(e.message,'error');}
 }
 
-// ══ CAMPAÑA ══
+// ══ CAMPAÑA — Dashboard de la Desarrolladora ══
 function renderCampaign(){
-  const cs=STATE.campaigns;
-  const totV=cs.reduce((a,c)=>a+c.visitas,0);
-  const totL=cs.reduce((a,c)=>a+c.leads,0);
-  const totB=cs.reduce((a,c)=>a+c.backers,0);
-  const avgC=totV?(totL/totV*100).toFixed(1):0;
+  const m=STATE.devMetrics||{};
+  const weekly=m.weekly_completed||[];
+  const perProd=m.per_product||[];
+
+  // métricas principales (todo derivado de DEV)
   document.getElementById('camp-metrics-bar').innerHTML=`
-    <div class="mc"><div class="mc-label">Visitas</div><div class="mc-val" style="color:var(--cyan)">${totV.toLocaleString()}</div><div class="mc-sub">todos los canales</div></div>
-    <div class="mc"><div class="mc-label">Conv. prom.</div><div class="mc-val" style="color:var(--orange)">${avgC}%</div><div class="mc-sub">leads/visitas</div></div>
-    <div class="mc"><div class="mc-label">Leads</div><div class="mc-val" style="color:var(--purple-light)">${totL}</div><div class="mc-sub">acumulados</div></div>
-    <div class="mc"><div class="mc-label">Backers</div><div class="mc-val" style="color:var(--green)">${totB}</div><div class="mc-sub">confirmados</div></div>`;
+    <div class="mc"><div class="mc-label">Proyectos</div><div class="mc-val" style="color:var(--cyan)">${m.products_total||0}</div><div class="mc-sub">${m.products_active||0} activos</div></div>
+    <div class="mc"><div class="mc-label">Tareas</div><div class="mc-val" style="color:var(--text0)">${m.tasks_total||0}</div><div class="mc-sub">en backlog</div></div>
+    <div class="mc"><div class="mc-label">Completado</div><div class="mc-val" style="color:var(--green)">${m.pct_done||0}%</div><div class="mc-sub">${m.tasks_done||0}/${m.tasks_total||0}</div></div>
+    <div class="mc"><div class="mc-label">Esta semana</div><div class="mc-val" style="color:var(--purple-light)">${m.week_total||0}</div><div class="mc-sub">tareas hechas</div></div>`;
 
-  // cards
+  // cards por estado
   const wrap=document.getElementById('camp-cards-wrap');
-  wrap.innerHTML='';
-  cs.forEach(c=>{
-    const div=document.createElement('div');div.className='camp-card';
-    div.innerHTML=`<div class="camp-card-header">
-      <div class="camp-card-title">${c.icon} ${c.name}</div>
-      <button class="btn btn-danger btn-sm btn-icon" onclick="deleteCampaign('${c.id}')">✕</button></div>
-      <div class="camp-card-body">
-        <div class="camp-mg">
-          <div class="cmi"><label>Visitas</label><input type="number" class="c" value="${c.visitas}" onchange="uCF('${c.id}','visitas',this.value)"/></div>
-          <div class="cmi"><label>Conv %</label><input type="number" step="0.1" class="o" value="${c.conversion}" onchange="uCF('${c.id}','conversion',this.value)"/></div>
-          <div class="cmi"><label>Leads</label><input type="number" class="p" value="${c.leads}" onchange="uCF('${c.id}','leads',this.value)"/></div>
-          <div class="cmi"><label>Backers</label><input type="number" class="g" value="${c.backers}" onchange="uCF('${c.id}','backers',this.value)"/></div>
-        </div>
-        <div class="camp-notes-row">
-          <textarea rows="2" placeholder="Notas de iteración..." onchange="uCF('${c.id}','notes',this.value)">${c.notes||''}</textarea>
-          <button class="btn btn-sm btn-primary" onclick="saveCampRow('${c.id}')" style="flex-shrink:0">💾</button>
-        </div>
-      </div>`;
-    wrap.appendChild(div);
-  });
+  wrap.innerHTML=`
+    <div class="status-grid">
+      <div class="status-card todo"><div class="status-val">${m.tasks_todo||0}</div><div class="status-lbl">⬜ Por hacer</div></div>
+      <div class="status-card doing"><div class="status-val">${m.tasks_doing||0}</div><div class="status-lbl">🔶 Haciendo</div></div>
+      <div class="status-card done"><div class="status-val">${m.tasks_done||0}</div><div class="status-lbl">✅ Hecho</div></div>
+    </div>`;
 
-  // right panel - summary
+  // panel derecho - progreso por producto
   const rb=document.getElementById('camp-right-body');
-  rb.innerHTML='';
-  const maxL=Math.max(...cs.map(c=>c.leads),1);
-  cs.forEach(c=>{
-    const div=document.createElement('div');div.className='canal-summary';
-    const conv=(c.visitas?(c.leads/c.visitas*100):0).toFixed(1);
-    const barW=Math.round(c.leads/maxL*100);
-    div.innerHTML=`<div class="cs-head"><span class="cs-icon">${c.icon}</span><span class="cs-name">${c.name}</span><span class="cs-conv" style="color:var(--orange)">${conv}%</span></div>
-      <div class="cs-bar-wrap"><div class="cs-bar-fill" style="width:${barW}%"></div></div>
-      <div class="cs-stats"><span class="cs-stat">👁 <span>${c.visitas.toLocaleString()}</span></span><span class="cs-stat">🎯 <span>${c.leads}</span></span><span class="cs-stat">⭐ <span>${c.backers}</span></span></div>`;
-    rb.appendChild(div);
-  });
+  if(!perProd.length){
+    rb.innerHTML='<div class="empty" style="padding:24px"><div class="empty-icon">📦</div>Sin productos todavía.</div>';
+  }else{
+    rb.innerHTML='';
+    perProd.forEach(p=>{
+      const div=document.createElement('div');div.className='canal-summary';
+      div.innerHTML=`<div class="cs-head"><span class="cs-icon">${p.icon}</span><span class="cs-name">${p.name}</span><span class="cs-conv" style="color:${p.color}">${p.pct}%</span></div>
+        <div class="cs-bar-wrap"><div class="cs-bar-fill" style="width:${p.pct}%;background:${p.color}"></div></div>
+        <div class="cs-stats"><span class="cs-stat">✅ <span>${p.done}</span></span><span class="cs-stat">📋 <span>${p.total}</span></span><span class="cs-stat">${p.status}</span></div>`;
+      rb.appendChild(div);
+    });
+  }
 
   renderCharts();
 }
 
 function renderCharts(){
-  const cs=STATE.campaigns;if(!cs.length)return;
-  const labels=cs.map(c=>c.name);
-  const leadsData=cs.map(c=>c.leads);
-  const convData=cs.map(c=>c.visitas?(c.leads/c.visitas*100).toFixed(1):0);
-  const colors=['#00e5ff','#ff6b35','#a87fff','#39ff14','#ffd700','#ff3e5e'];
+  if(typeof Chart==='undefined')return;
+  const m=STATE.devMetrics||{};
+  const weekly=m.weekly_completed||[];
 
   const chartCfg={
     responsive:true,maintainAspectRatio:false,
     plugins:{legend:{display:false}},
     scales:{
       x:{ticks:{color:'#4e6880',font:{size:9}},grid:{color:'rgba(30,45,61,.5)'}},
-      y:{ticks:{color:'#4e6880',font:{size:9}},grid:{color:'rgba(30,45,61,.5)'}}
+      y:{beginAtZero:true,ticks:{color:'#4e6880',font:{size:9},precision:0},grid:{color:'rgba(30,45,61,.5)'}}
     }
   };
 
-  // Leads chart
-  const c1=document.getElementById('chart-leads');
-  if(charts.leads){charts.leads.destroy();}
-  charts.leads=new Chart(c1,{type:'bar',data:{
-    labels,datasets:[{data:leadsData,backgroundColor:colors.slice(0,labels.length).map(c=>c+'88'),borderColor:colors.slice(0,labels.length),borderWidth:1,borderRadius:3}]
-  },options:{...chartCfg,plugins:{...chartCfg.plugins}}});
+  // Gráfico semanal (tareas completadas por día)
+  const c1=document.getElementById('chart-weekly');
+  if(c1){
+    if(charts.weekly){charts.weekly.destroy();}
+    charts.weekly=new Chart(c1,{type:'bar',data:{
+      labels:weekly.map(d=>d.label),
+      datasets:[{data:weekly.map(d=>d.count),backgroundColor:'rgba(124,63,255,.55)',borderColor:'#7c3fff',borderWidth:1,borderRadius:3}]
+    },options:chartCfg});
+  }
 
-  // Conv chart
-  const c2=document.getElementById('chart-conv');
-  if(charts.conv){charts.conv.destroy();}
-  charts.conv=new Chart(c2,{type:'bar',data:{
-    labels,datasets:[{data:convData,backgroundColor:colors.slice(0,labels.length).map(c=>c+'66'),borderColor:colors.slice(0,labels.length),borderWidth:1,borderRadius:3}]
-  },options:{...chartCfg,scales:{...chartCfg.scales,y:{...chartCfg.scales.y,ticks:{...chartCfg.scales.y.ticks,callback:v=>v+'%'}}}}});
-}
-
-function uCF(id,field,val){if(!campDirty[id])campDirty[id]={};campDirty[id][field]=field==='notes'?val:(parseFloat(val)||0);}
-async function saveCampRow(id){
-  const c=STATE.campaigns.find(x=>x.id===id);if(!c)return;
-  try{await api(`/api/campaigns/${id}`,'PUT',{...c,...(campDirty[id]||{})});delete campDirty[id];await loadCampaigns();renderCampaign();toast('Canal guardado','success');}
-  catch(e){toast(e.message,'error');}
-}
-function openCampaignModal(){['camp-name','camp-notes'].forEach(i=>document.getElementById(i).value='');document.getElementById('camp-icon').value='📊';openModal('modal-campaign');}
-async function saveCampaign(){
-  const name=document.getElementById('camp-name').value.trim();if(!name){shake('camp-name');return;}
-  try{await api('/api/campaigns','POST',{name,icon:v('camp-icon')||'📊',notes:v('camp-notes')});closeModal('modal-campaign');await loadCampaigns();renderCampaign();toast('Canal creado','success');}
-  catch(e){toast(e.message,'error');}
-}
-async function deleteCampaign(id){
-  if(!confirm('¿Eliminar canal?'))return;
-  try{await api(`/api/campaigns/${id}`,'DELETE');await loadCampaigns();renderCampaign();toast('Canal eliminado','error');}
-  catch(e){toast(e.message,'error');}
+  // Gráfico distribución por estado (doughnut)
+  const c2=document.getElementById('chart-status');
+  if(c2){
+    if(charts.status){charts.status.destroy();}
+    charts.status=new Chart(c2,{type:'doughnut',data:{
+      labels:['Por hacer','Haciendo','Hecho'],
+      datasets:[{data:[m.tasks_todo||0,m.tasks_doing||0,m.tasks_done||0],
+        backgroundColor:['rgba(78,104,128,.6)','rgba(255,107,53,.7)','rgba(57,255,20,.55)'],
+        borderColor:['#4e6880','#ff6b35','#39ff14'],borderWidth:1}]
+    },options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'bottom',labels:{color:'#94a8bc',font:{size:10},boxWidth:12,padding:8}}}}});
+  }
 }
 
 // ══ ESTRATEGIA ══
@@ -1957,8 +1942,8 @@ async function sendChat(){
     hideTyping();
     appendMsg('bot',data.response||'Acción completada.');
     if(data.refresh){
-      await Promise.all([loadProducts(),loadTasks(),loadStats()]);
-      renderDev();renderStats();
+      await Promise.all([loadProducts(),loadTasks(),loadStats(),loadDevMetrics()]);
+      renderDev();renderStats();renderCampaign();
       toast('Sistema actualizado','success');
     }
   }catch(e){
