@@ -4,7 +4,7 @@ from pymongo import MongoClient
 from pymongo.server_api import ServerApi
 from bson import ObjectId
 from datetime import datetime
-import os, json, certifi
+import os, json, re, certifi
 
 try:
     from groq import Groq as GroqClient
@@ -21,6 +21,8 @@ CORS(app)
 MONGODB_URI = os.environ.get('MONGODB_URI', '')
 MONGODB_DB  = os.environ.get('MONGODB_DB', 'commandcenter')
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
+# Modelo Groq (env var para poder cambiarlo sin redeploy; Qwen3-32B está en preview).
+GROQ_MODEL = os.environ.get('GROQ_MODEL', 'qwen/qwen3-32b')
 
 client = MongoClient(
     MONGODB_URI,
@@ -50,6 +52,15 @@ def doc(d):
 def oid(s):
     return ObjectId(s)
 
+_THINK_RE = re.compile(r'<think>.*?</think>', re.DOTALL | re.IGNORECASE)
+
+def strip_think(text):
+    """Quita bloques <think>…</think> que emiten los modelos reasoning (Qwen3).
+    Red de seguridad por si reasoning_format no los oculta en algún caso."""
+    if not text:
+        return text
+    return _THINK_RE.sub('', text).strip()
+
 # ============================================================================
 # HEALTH
 # ============================================================================
@@ -66,78 +77,6 @@ def health():
         })
     except Exception as e:
         return jsonify({'status': 'error', 'db': str(e)}), 500
-
-# ============================================================================
-# CRM — CONTACTS
-# ============================================================================
-
-@app.route('/api/contacts', methods=['GET'])
-def get_contacts():
-    try:
-        return jsonify([doc(r) for r in db.contacts.find().sort('updated_at', -1)])
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/contacts', methods=['POST'])
-def create_contact():
-    d = request.json
-    try:
-        now = datetime.utcnow()
-        contact = {
-            'name': d.get('name', ''), 'medio': d.get('medio', ''),
-            'empresa': d.get('empresa', ''), 'tipo': d.get('tipo', 'prensa'),
-            'status': d.get('status', 'nuevo'), 'email': d.get('email', ''),
-            'telefono': d.get('telefono', ''), 'last_contact': d.get('last_contact', ''),
-            'next_followup': d.get('next_followup', ''), 'notes': d.get('notes', ''),
-            'created_at': now, 'updated_at': now,
-        }
-        result = db.contacts.insert_one(contact)
-        contact['_id'] = result.inserted_id
-        return jsonify(doc(contact)), 201
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/contacts/<string:cid>', methods=['PUT'])
-def update_contact(cid):
-    d = request.json
-    try:
-        update = {
-            'name': d.get('name', ''), 'medio': d.get('medio', ''),
-            'empresa': d.get('empresa', ''), 'tipo': d.get('tipo', 'prensa'),
-            'status': d.get('status', 'nuevo'), 'email': d.get('email', ''),
-            'telefono': d.get('telefono', ''), 'last_contact': d.get('last_contact', ''),
-            'next_followup': d.get('next_followup', ''), 'notes': d.get('notes', ''),
-            'updated_at': datetime.utcnow(),
-        }
-        result = db.contacts.find_one_and_update(
-            {'_id': oid(cid)}, {'$set': update}, return_document=True)
-        if not result:
-            return jsonify({'error': 'Contact not found'}), 404
-        return jsonify(doc(result))
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/contacts/<string:cid>', methods=['DELETE'])
-def delete_contact(cid):
-    try:
-        db.contacts.delete_one({'_id': oid(cid)})
-        return jsonify({'ok': True})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/contacts/<string:cid>/status', methods=['PATCH'])
-def patch_contact_status(cid):
-    d = request.json
-    try:
-        result = db.contacts.find_one_and_update(
-            {'_id': oid(cid)},
-            {'$set': {'status': d['status'], 'updated_at': datetime.utcnow()}},
-            return_document=True)
-        if not result:
-            return jsonify({'error': 'Contact not found'}), 404
-        return jsonify(doc(result))
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
 # ============================================================================
 # PRODUCTS
@@ -375,8 +314,6 @@ def get_stats():
         tasks_total = db.tasks.count_documents({})
         tasks_done_n = db.tasks.count_documents({'done': 1})
         return jsonify({
-            'contacts_total':  db.contacts.count_documents({}),
-            'contacts_active': db.contacts.count_documents({'status': {'$ne': 'cerrado'}}),
             'tasks_doing':     db.tasks.count_documents({'status': 'doing'}),
             'tasks_todo':      db.tasks.count_documents({'status': 'todo'}),
             'tasks_done':      tasks_done_n,
@@ -695,11 +632,12 @@ def chat():
     for _ in range(8):
         try:
             response = groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model=GROQ_MODEL,
                 messages=all_messages,
                 tools=GROQ_TOOLS,
                 tool_choice="auto",
                 max_tokens=1024,
+                reasoning_format="hidden",
             )
         except Exception as e:
             return jsonify({'response': f'Error Groq: {str(e)}', 'refresh': did_tool_calls})
@@ -709,7 +647,7 @@ def chat():
         finish_reason = choice.finish_reason
 
         # Append assistant message (with tool_calls if present)
-        asst_msg = {"role": "assistant", "content": message.content or ""}
+        asst_msg = {"role": "assistant", "content": strip_think(message.content) or ""}
         if message.tool_calls:
             asst_msg["tool_calls"] = [
                 {"id": tc.id, "type": "function",
@@ -733,7 +671,7 @@ def chat():
                 })
         else:
             return jsonify({
-                "response": message.content or "Acción completada.",
+                "response": strip_think(message.content) or "Acción completada.",
                 "refresh": did_tool_calls
             })
 
@@ -859,41 +797,16 @@ input,select,textarea{font-family:inherit;}
 .btn-sm{padding:3px 9px;font-size:10px;}
 .btn-icon{padding:5px 7px;}
 
-/* ══ CRM ══ */
-#panel-crm .kanban-wrap{flex:1;overflow-x:auto;overflow-y:hidden;padding:14px 18px;display:flex;gap:10px;align-items:flex-start;}
-.kanban-col{width:228px;flex-shrink:0;display:flex;flex-direction:column;max-height:100%;}
-.kanban-col-head{display:flex;align-items:center;justify-content:space-between;
-  padding:7px 11px;border-top:2px solid var(--cc,var(--border));
-  background:var(--bg2);margin-bottom:7px;flex-shrink:0;}
-.kanban-col-name{font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--cc,var(--text1));}
-.kanban-col-count{background:var(--cc,var(--border2));color:var(--bg0);font-size:9px;font-weight:700;padding:1px 6px;border-radius:2px;}
-.kanban-cards{overflow-y:auto;display:flex;flex-direction:column;gap:6px;padding-bottom:14px;}
-.contact-card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);
-  padding:10px 12px;cursor:pointer;transition:all .15s;position:relative;}
-.contact-card:hover{border-color:var(--border3);transform:translateY(-1px);box-shadow:0 4px 14px rgba(0,0,0,.4);}
-.cc-name{font-family:var(--sans);font-size:12px;font-weight:700;margin-bottom:3px;}
-.cc-medio{font-size:10px;color:var(--text1);margin-bottom:4px;}
-.cc-tags{display:flex;gap:3px;flex-wrap:wrap;margin-bottom:4px;}
+/* ── TAGS (prioridad/impacto, usados en DEV) ── */
 .tag{padding:1px 6px;border-radius:2px;font-size:9px;font-weight:700;text-transform:uppercase;}
-.tag-prensa{background:rgba(0,229,255,.1);color:var(--cyan);border:1px solid rgba(0,229,255,.2);}
-.tag-partner{background:rgba(168,127,255,.1);color:var(--purple-light);border:1px solid rgba(168,127,255,.25);}
-.tag-cliente{background:rgba(57,255,20,.08);color:var(--green);border:1px solid rgba(57,255,20,.2);}
 .tag-alto{background:rgba(255,62,94,.1);color:var(--red);border:1px solid rgba(255,62,94,.2);}
 .tag-medio{background:rgba(255,215,0,.08);color:var(--yellow);border:1px solid rgba(255,215,0,.2);}
 .tag-bajo{background:rgba(78,104,128,.12);color:var(--text1);border:1px solid var(--border2);}
-.cc-follow{font-size:10px;color:var(--text2);display:flex;align-items:center;gap:4px;}
-.cc-follow .dv{color:var(--orange);}
-.cc-notes{font-size:10px;color:var(--text1);line-height:1.4;margin-top:4px;padding-top:4px;border-top:1px solid var(--border);}
-.cc-actions{position:absolute;top:7px;right:7px;display:none;gap:3px;}
-.contact-card:hover .cc-actions{display:flex;}
+/* ── ACTION BUTTONS (usados en DEV product/task cards) ── */
 .ca-btn{width:20px;height:20px;background:var(--bg3);border:1px solid var(--border2);
   border-radius:3px;color:var(--text1);font-size:9px;display:flex;align-items:center;justify-content:center;transition:all .1s;}
 .ca-btn:hover{background:var(--bg4);color:var(--text0);}
 .ca-btn.del:hover{color:var(--red);border-color:var(--red);}
-.search-bar{display:flex;align-items:center;gap:7px;background:var(--bg2);border:1px solid var(--border);
-  border-radius:var(--r);padding:5px 9px;}
-.search-bar input{background:none;border:none;outline:none;color:var(--text0);font-size:12px;width:150px;}
-.search-bar input::placeholder{color:var(--text2);}
 
 /* ══ DEV ══ */
 .dev-wrap{flex:1;display:flex;overflow:hidden;}
@@ -1181,10 +1094,7 @@ input,select,textarea{font-family:inherit;}
     <div><div class="brand-name">OPENAETH</div><div class="brand-version">COMMAND CORE v2.1</div></div>
   </div>
   <div class="topbar-nav">
-    <button class="nav-tab active" style="--tab-color:var(--cyan)" data-panel="crm" onclick="switchPanel('crm',this)">
-      🧲 CRM <span class="nav-badge" id="nb-crm">0</span>
-    </button>
-    <button class="nav-tab" style="--tab-color:var(--orange)" data-panel="dev" onclick="switchPanel('dev',this)">
+    <button class="nav-tab active" style="--tab-color:var(--orange)" data-panel="dev" onclick="switchPanel('dev',this)">
       ⚙️ DEV <span class="nav-badge" id="nb-dev" style="background:var(--orange)">0</span><span id="nb-dev-tasks" style="font-size:9px;color:var(--text2);margin-left:2px"></span>
     </button>
     <button class="nav-tab" style="--tab-color:var(--purple-light)" data-panel="campaign" onclick="switchPanel('campaign',this)">
@@ -1198,7 +1108,7 @@ input,select,textarea{font-family:inherit;}
     </button>
   </div>
   <div class="topbar-right">
-    <div class="topbar-stat"><div class="topbar-stat-val" id="ts-leads">—</div><div class="topbar-stat-label">leads activos</div></div>
+    <div class="topbar-stat"><div class="topbar-stat-val" id="ts-todo">—</div><div class="topbar-stat-label">tasks todo</div></div>
     <div class="topbar-stat"><div class="topbar-stat-val" style="color:var(--orange)" id="ts-doing">—</div><div class="topbar-stat-label">en doing</div></div>
     <div class="topbar-stat"><div class="topbar-stat-val" style="color:var(--purple-light)" id="ts-logs">—</div><div class="topbar-stat-label">logs</div></div>
     <div class="topbar-clock" id="clock">—</div>
@@ -1211,10 +1121,7 @@ input,select,textarea{font-family:inherit;}
 <div class="sidebar">
   <div class="sidebar-section">
     <div class="sidebar-label">Módulos</div>
-    <button class="sidebar-link active" style="--lc:var(--cyan)" id="sl-crm" onclick="switchPanel('crm')">
-      🧲 CRM <span class="sidebar-link-badge" id="slb-crm">0</span>
-    </button>
-    <button class="sidebar-link" style="--lc:var(--orange)" id="sl-dev" onclick="switchPanel('dev')">
+    <button class="sidebar-link active" style="--lc:var(--orange)" id="sl-dev" onclick="switchPanel('dev')">
       ⚙️ DEV <span class="sidebar-link-badge" style="background:var(--orange)" id="slb-dev">0</span>
     </button>
     <button class="sidebar-link" style="--lc:var(--purple-light)" id="sl-campaign" onclick="switchPanel('campaign')">🚀 Campaña</button>
@@ -1227,16 +1134,15 @@ input,select,textarea{font-family:inherit;}
   <div class="sidebar-section">
     <div class="sidebar-label">Conexiones</div>
     <div class="sb-widget">
-      <div class="conn-row"><div class="conn-dot" style="background:var(--cyan)"></div>Contacto → Cliente</div>
-      <div class="conn-row"><div class="conn-dot" style="background:var(--green)"></div>Feedback → Producto</div>
-      <div class="conn-row"><div class="conn-dot" style="background:var(--orange)"></div>Producto → Narrativa</div>
-      <div class="conn-row"><div class="conn-dot" style="background:var(--purple-light)"></div>Narrativa → Conversión</div>
+      <div class="conn-row"><div class="conn-dot" style="background:var(--orange)"></div>Task → Producto</div>
+      <div class="conn-row"><div class="conn-dot" style="background:var(--green)"></div>Cumplimiento → Readiness</div>
+      <div class="conn-row"><div class="conn-dot" style="background:var(--purple-light)"></div>Producto → Campaña</div>
+      <div class="conn-row"><div class="conn-dot" style="background:var(--cyan)"></div>Insight → Decisión</div>
     </div>
   </div>
   <div class="sidebar-section">
     <div class="sidebar-label">Estado global</div>
     <div class="sb-widget">
-      <div class="gs-row"><span>Contactos</span><span class="gs-val" style="color:var(--cyan)" id="gs-c">—</span></div>
       <div class="gs-row"><span>Tasks pendientes</span><span class="gs-val" style="color:var(--orange)" id="gs-t">—</span></div>
       <div class="gs-row"><span>Productos activos</span><span class="gs-val" style="color:var(--orange)" id="gs-prod">—</span></div>
       <div class="gs-row"><span>Dev completado</span><span class="gs-val" style="color:var(--green)" id="gs-p">—</span></div>
@@ -1248,21 +1154,8 @@ input,select,textarea{font-family:inherit;}
 <!-- MAIN -->
 <div class="main">
 
-  <!-- CRM -->
-  <div class="panel active" id="panel-crm">
-    <div class="panel-header">
-      <div class="panel-title" style="color:var(--cyan)">🧲 CRM <span class="panel-sub">— Relaciones & Conversión</span></div>
-      <div class="panel-actions">
-        <div class="search-bar"><span style="color:var(--text2);font-size:11px">🔍</span>
-          <input type="text" placeholder="Buscar..." id="crm-search" oninput="filterContacts()"/></div>
-        <button class="btn btn-primary" onclick="openContactModal()">+ Contacto</button>
-      </div>
-    </div>
-    <div class="kanban-wrap" id="crm-kanban" style="flex:1;overflow-x:auto;overflow-y:hidden;padding:14px 18px;display:flex;gap:10px;align-items:flex-start;"></div>
-  </div>
-
   <!-- DEV -->
-  <div class="panel" id="panel-dev">
+  <div class="panel active" id="panel-dev">
     <div class="panel-header">
       <div class="panel-title" style="color:var(--orange)">⚙️ DEV <span class="panel-sub">— Portafolio de productos</span></div>
       <div class="panel-actions">
@@ -1328,16 +1221,15 @@ input,select,textarea{font-family:inherit;}
         <div class="guide-hero">
           <div class="guide-hero-left">
             <div class="guide-hero-title">OpenAETH Command Core</div>
-            <div class="guide-hero-sub">Sistema operativo para tu startup. Relaciones, ejecución, marketing y estrategia en un solo lugar — todo conectado. Un contacto se convierte en cliente, ese feedback alimenta el producto, el producto mejora la narrativa.</div>
+            <div class="guide-hero-sub">Sistema operativo para tu startup, centrado en ejecución. Gestión de tareas con IA integrada — el cumplimiento del módulo DEV alimenta las métricas de campaña, y la estrategia captura el aprendizaje.</div>
             <div class="guide-hero-tags">
-              <span class="guide-hero-tag">🧲 CRM</span>
               <span class="guide-hero-tag">⚙️ DEV</span>
               <span class="guide-hero-tag">🚀 CAMPAÑA</span>
               <span class="guide-hero-tag">🧠 ESTRATEGIA</span>
+              <span class="guide-hero-tag">🤖 IA</span>
             </div>
           </div>
           <div class="guide-hero-right">
-            <div class="guide-stat-pill"><div class="guide-stat-val" style="color:var(--cyan)" id="g-sc">—</div><div class="guide-stat-label">contactos</div></div>
             <div class="guide-stat-pill"><div class="guide-stat-val" style="color:var(--orange)" id="g-st">—</div><div class="guide-stat-label">tasks activas</div></div>
             <div class="guide-stat-pill"><div class="guide-stat-val" style="color:var(--orange)" id="g-prod">—</div><div class="guide-stat-label">productos activos</div></div>
             <div class="guide-stat-pill"><div class="guide-stat-val" style="color:var(--green)" id="g-sp">—</div><div class="guide-stat-label">dev completado</div></div>
@@ -1349,33 +1241,31 @@ input,select,textarea{font-family:inherit;}
         <div class="guide-flow">
           <div class="guide-flow-title">🔗 Flujo del sistema</div>
           <div class="guide-flow-row">
-            <div class="gfn"><div class="gfn-icon">🧲</div><div class="gfn-label">Contacto</div><div class="gfn-sub">CRM</div></div>
+            <div class="gfn"><div class="gfn-icon">🤖</div><div class="gfn-label">IA</div><div class="gfn-sub">cargá productos/tasks</div></div>
             <div class="gfa">→</div>
-            <div class="gfn"><div class="gfn-icon">💬</div><div class="gfn-label">Conversación</div><div class="gfn-sub">follow-up</div></div>
+            <div class="gfn"><div class="gfn-icon">⚙️</div><div class="gfn-label">Task DEV</div><div class="gfn-sub">backlog por módulo</div></div>
             <div class="gfa">→</div>
-            <div class="gfn"><div class="gfn-icon">✅</div><div class="gfn-label">Cerrado</div><div class="gfn-sub">deal / cobertura</div></div>
+            <div class="gfn"><div class="gfn-icon">✅</div><div class="gfn-label">Cumplimiento</div><div class="gfn-sub">done / total</div></div>
+            <div class="gfa">→</div>
+            <div class="gfn"><div class="gfn-icon">🚀</div><div class="gfn-label">Campaña</div><div class="gfn-sub">readiness→conv</div></div>
             <div class="gfa">→</div>
             <div class="gfn"><div class="gfn-icon">🔍</div><div class="gfn-label">Insight</div><div class="gfn-sub">Estrategia</div></div>
-            <div class="gfa">→</div>
-            <div class="gfn"><div class="gfn-icon">⚙️</div><div class="gfn-label">Task DEV</div><div class="gfn-sub">feedback→producto</div></div>
-            <div class="gfa">→</div>
-            <div class="gfn"><div class="gfn-icon">🚀</div><div class="gfn-label">Campaña</div><div class="gfn-sub">narrativa→conv</div></div>
           </div>
         </div>
 
-        <!-- CRM card -->
+        <!-- ASISTENTE IA card -->
         <div class="guide-card">
           <div class="guide-card-head">
-            <div class="guide-card-icon">🧲</div>
-            <div><div class="guide-card-title" style="color:var(--cyan)">CRM</div><div class="guide-card-sub">Pipeline Kanban · 5 estados</div></div>
+            <div class="guide-card-icon">🤖</div>
+            <div><div class="guide-card-title" style="color:var(--purple-light)">ASISTENTE IA</div><div class="guide-card-sub">Groq · Qwen3-32B · gestión por chat</div></div>
           </div>
           <div class="guide-steps">
-            <div class="guide-step"><div class="gsn hl">1</div><div><div class="gs-title">Crear contacto</div><div class="gs-desc">+ Contacto → tipo (prensa/partner/cliente), medio de origen, fecha de follow-up.</div></div></div>
-            <div class="guide-step"><div class="gsn">2</div><div><div class="gs-title">Avanzar pipeline</div><div class="gs-desc">Hover card → <span class="guide-kbd">▶</span> para siguiente estado, o editá desde el modal.</div></div></div>
-            <div class="guide-step"><div class="gsn">3</div><div><div class="gs-title">Notas post-contacto</div><div class="gs-desc">Abrí la card, actualizá notas y próximo follow-up. Es tu historial de la relación.</div></div></div>
-            <div class="guide-step"><div class="gsn">4</div><div><div class="gs-title">Buscar</div><div class="gs-desc">Barra de búsqueda o <span class="guide-kbd">/</span> — filtra nombre, empresa, notas en tiempo real.</div></div></div>
+            <div class="guide-step"><div class="gsn hl">1</div><div><div class="gs-title">Abrí el chat</div><div class="gs-desc">Botón 🤖 abajo a la derecha. Pedile en lenguaje natural lo que necesitás cargar o actualizar.</div></div></div>
+            <div class="guide-step"><div class="gsn">2</div><div><div class="gs-title">Crear producto + tasks</div><div class="gs-desc"><em>"Cargá el producto X y creá las tareas A, B, C"</em> — lo hace en una sola operación atómica.</div></div></div>
+            <div class="guide-step"><div class="gsn">3</div><div><div class="gs-title">Agregar y actualizar</div><div class="gs-desc"><em>"Agregá estas tareas a X"</em>, <em>"marcá la task Y como done"</em>. Busca por nombre, sin IDs.</div></div></div>
+            <div class="guide-step"><div class="gsn">4</div><div><div class="gs-title">Consultar estado</div><div class="gs-desc"><em>"listá los productos"</em>, <em>"qué tasks tiene X"</em>. El panel DEV se refresca solo.</div></div></div>
           </div>
-          <div class="guide-tip"><strong>Tip:</strong> Al cerrar un deal → registrá el aprendizaje como <em>Insight</em> en Estrategia.</div>
+          <div class="guide-tip"><strong>Tip:</strong> La IA es el camino rápido para poblar el backlog; el panel DEV queda para ajustes finos.</div>
         </div>
 
         <!-- DEV card -->
@@ -1418,7 +1308,7 @@ input,select,textarea{font-family:inherit;}
             <div class="guide-step"><div class="gsn hl">1</div><div><div class="gs-title">Registrar decisiones</div><div class="gs-desc">Cada decisión no trivial → registrar. ¿Por qué? ¿Qué descartaste?</div></div></div>
             <div class="guide-step"><div class="gsn">2</div><div><div class="gs-title">Capturar insights</div><div class="gs-desc">Algo sorprendente, un cliente revelador, un canal inesperado → Insight.</div></div></div>
             <div class="guide-step"><div class="gsn">3</div><div><div class="gs-title">Mapear riesgos</div><div class="gs-desc">Un riesgo escrito es gestionable. Dependencias, supuestos frágiles, amenazas.</div></div></div>
-            <div class="guide-step"><div class="gsn">4</div><div><div class="gs-title">Conectar módulos</div><div class="gs-desc">Campo Conexiones: vinculá el log a contactos, tasks o canales.</div></div></div>
+            <div class="guide-step"><div class="gsn">4</div><div><div class="gs-title">Conectar módulos</div><div class="gs-desc">Campo Conexiones: vinculá el log a productos, tasks o canales.</div></div></div>
           </div>
           <div class="guide-tip"><strong>Tip:</strong> Revisá semanalmente. La diferencia entre hoy y hace un mes está ahí escrita.</div>
         </div>
@@ -1430,14 +1320,12 @@ input,select,textarea{font-family:inherit;}
             <div><div class="guide-card-title">Atajos de teclado</div></div>
           </div>
           <div class="guide-shortcut-grid">
-            <div class="gsr"><span class="gsr-label">CRM</span><span class="guide-kbd">1</span></div>
-            <div class="gsr"><span class="gsr-label">DEV</span><span class="guide-kbd">2</span></div>
-            <div class="gsr"><span class="gsr-label">Campaña</span><span class="guide-kbd">3</span></div>
-            <div class="gsr"><span class="gsr-label">Estrategia</span><span class="guide-kbd">4</span></div>
-            <div class="gsr"><span class="gsr-label">Guía</span><span class="guide-kbd">5</span></div>
+            <div class="gsr"><span class="gsr-label">DEV</span><span class="guide-kbd">1</span></div>
+            <div class="gsr"><span class="gsr-label">Campaña</span><span class="guide-kbd">2</span></div>
+            <div class="gsr"><span class="gsr-label">Estrategia</span><span class="guide-kbd">3</span></div>
+            <div class="gsr"><span class="gsr-label">Guía</span><span class="guide-kbd">4</span></div>
             <div class="gsr"><span class="gsr-label">Cerrar modal</span><span class="guide-kbd">Esc</span></div>
-            <div class="gsr"><span class="gsr-label">Buscar</span><span class="guide-kbd">/</span></div>
-            <div class="gsr"><span class="gsr-label">Avanzar card</span><span class="guide-kbd">▶</span></div>
+            <div class="gsr"><span class="gsr-label">Asistente IA</span><span class="guide-kbd">🤖</span></div>
           </div>
         </div>
 
@@ -1448,8 +1336,8 @@ input,select,textarea{font-family:inherit;}
             <div><div class="guide-card-title">Rutina diaria · 15 min</div></div>
           </div>
           <div class="gr-row">
-            <div class="gr-icon" style="background:var(--cyan-dim);border:1px solid rgba(0,229,255,.2)">☀️</div>
-            <div><div class="gs-title" style="color:var(--cyan)">Mañana — CRM (5 min)</div><div class="gs-desc">Follow-ups del día, actualizar estados de conversaciones de ayer.</div></div>
+            <div class="gr-icon" style="background:var(--purple-dim);border:1px solid rgba(124,63,255,.2)">☀️</div>
+            <div><div class="gs-title" style="color:var(--purple-light)">Mañana — Planificar con IA (5 min)</div><div class="gs-desc">Pedile al asistente que cargue el backlog del día por producto y módulo.</div></div>
           </div>
           <div class="gr-row">
             <div class="gr-icon" style="background:var(--orange-dim);border:1px solid rgba(255,107,53,.2)">⚡</div>
@@ -1470,37 +1358,6 @@ input,select,textarea{font-family:inherit;}
 </div><!-- /shell -->
 
 <div class="toast-wrap" id="toast-wrap"></div>
-
-<!-- MODAL CONTACTO -->
-<div class="overlay" id="modal-contact" onclick="overlayClose(event,'modal-contact')">
-  <div class="modal">
-    <div class="modal-head"><div class="modal-title" id="contact-modal-title">Nuevo Contacto</div><button class="modal-close" onclick="closeModal('modal-contact')">✕</button></div>
-    <div class="modal-body">
-      <input type="hidden" id="contact-id"/>
-      <div class="f-row">
-        <div class="f-group"><label class="f-label">Nombre *</label><input class="f-input" id="c-name" placeholder="Nombre completo"/></div>
-        <div class="f-group"><label class="f-label">Tipo</label><select class="f-select" id="c-tipo"><option value="prensa">📰 Prensa</option><option value="partner">🤝 Partner</option><option value="cliente">💼 Cliente</option></select></div>
-      </div>
-      <div class="f-row">
-        <div class="f-group"><label class="f-label">Medio / Canal</label><input class="f-input" id="c-medio" placeholder="TechCrunch, LinkedIn..."/></div>
-        <div class="f-group"><label class="f-label">Empresa</label><input class="f-input" id="c-empresa" placeholder="Nombre empresa"/></div>
-      </div>
-      <div class="f-row">
-        <div class="f-group"><label class="f-label">Email</label><input class="f-input" id="c-email" type="email"/></div>
-        <div class="f-group"><label class="f-label">Teléfono</label><input class="f-input" id="c-telefono"/></div>
-      </div>
-      <div class="f-row">
-        <div class="f-group"><label class="f-label">Estado</label><select class="f-select" id="c-status"><option value="nuevo">🔵 Nuevo</option><option value="contactado">🟡 Contactado</option><option value="en conversacion">🟠 En conversación</option><option value="interesado">🟣 Interesado</option><option value="cerrado">🟢 Cerrado</option></select></div>
-        <div class="f-group"><label class="f-label">Próximo follow-up</label><input class="f-input" id="c-followup" type="date"/></div>
-      </div>
-      <div class="f-group"><label class="f-label">Notas</label><textarea class="f-textarea" id="c-notes" placeholder="Contexto, intereses, estado de la conversación..."></textarea></div>
-    </div>
-    <div class="modal-foot">
-      <button class="btn btn-danger btn-sm" id="contact-del-btn" onclick="deleteContact()" style="display:none">🗑 Eliminar</button>
-      <div style="display:flex;gap:7px"><button class="btn" onclick="closeModal('modal-contact')">Cancelar</button><button class="btn btn-primary" onclick="saveContact()">Guardar</button></div>
-    </div>
-  </div>
-</div>
 
 <!-- MODAL TASK -->
 <div class="overlay" id="modal-task" onclick="overlayClose(event,'modal-task')">
@@ -1601,7 +1458,7 @@ input,select,textarea{font-family:inherit;}
       <div class="f-group"><label class="f-label">Contenido *</label><textarea class="f-textarea" id="l-text" rows="4" placeholder="Describí con suficiente contexto para entenderlo en el futuro..."></textarea></div>
       <div class="f-group">
         <label class="f-label">Conexiones <span class="f-hint">(separadas por coma)</span></label>
-        <input class="f-input" id="l-links" placeholder="CRM→Marcos, DEV→Backend, Campaña→Landing"/>
+        <input class="f-input" id="l-links" placeholder="DEV→Backend, Campaña→Landing, Producto→X"/>
       </div>
     </div>
     <div class="modal-foot">
@@ -1613,19 +1470,12 @@ input,select,textarea{font-family:inherit;}
 
 <script>
 const API='';
-let STATE={contacts:[],tasks:[],campaigns:[],logs:[],stats:{},products:[]};
-let logFilter='',crm_search='';
+let STATE={tasks:[],campaigns:[],logs:[],stats:{},products:[]};
+let logFilter='';
 let modExp={Auth:true,Backend:true,UI:true,'Multi-IA':true};
 const campDirty={};
 let charts={leads:null,conv:null};
 
-const CRM_COLS=[
-  {key:'nuevo',label:'Nuevo',color:'#4e6880'},
-  {key:'contactado',label:'Contactado',color:'#ffd700'},
-  {key:'en conversacion',label:'En conversación',color:'#ff6b35'},
-  {key:'interesado',label:'Interesado',color:'#a87fff'},
-  {key:'cerrado',label:'Cerrado',color:'#39ff14'},
-];
 const LOG_C={Decision:'#00e5ff',Insight:'#ffd700',Riesgo:'#ff3e5e',Oportunidad:'#39ff14'};
 const MODS=['Auth','Backend','UI','Multi-IA'];
 
@@ -1646,7 +1496,7 @@ async function api(path,method='GET',body=null){
 
 async function boot(){
   try{
-    await Promise.all([loadContacts(),loadProducts(),loadTasks(),loadCampaigns(),loadLogs(),loadStats()]);
+    await Promise.all([loadProducts(),loadTasks(),loadCampaigns(),loadLogs(),loadStats()]);
     const old=document.getElementById('boot-err');if(old)old.remove();
     render();
   }catch(e){
@@ -1664,13 +1514,12 @@ async function boot(){
   }
 }
 
-async function loadContacts(){STATE.contacts=await api('/api/contacts');}
 async function loadProducts(){STATE.products=await api('/api/products');}
 async function loadTasks(){STATE.tasks=await api('/api/tasks');}
 async function loadCampaigns(){STATE.campaigns=await api('/api/campaigns');}
 async function loadLogs(){STATE.logs=await api('/api/logs');}
 async function loadStats(){STATE.stats=await api('/api/stats');}
-function render(){renderCRM();renderDev();renderCampaign();renderStrategy();renderStats();}
+function render(){renderDev();renderCampaign();renderStrategy();renderStats();}
 
 // panel switch
 function switchPanel(name,btnEl){
@@ -1688,89 +1537,13 @@ function renderStats(){
   const s=STATE.stats;
   const pct=s.tasks_total?Math.round(s.tasks_done/s.tasks_total*100):0;
   const setText=(id,v)=>{const el=document.getElementById(id);if(el)el.textContent=v??'—';};
-  setText('ts-leads',s.contacts_active);setText('ts-doing',s.tasks_doing);setText('ts-logs',s.logs_total);
-  setText('gs-c',s.contacts_total);setText('gs-t',s.tasks_todo);setText('gs-prod',(s.products_active||s.products_total||0)+' activos');setText('gs-p',pct+'%');setText('gs-l',s.logs_total);
-  setText('g-sc',s.contacts_total);setText('g-st',(s.tasks_doing||0)+(s.tasks_todo||0));setText('g-prod',s.products_active||s.products_total||0);setText('g-sp',pct+'%');setText('g-sl',s.logs_total);
-  setText('nb-crm',s.contacts_total||0);setText('slb-crm',s.contacts_total||0);
+  setText('ts-todo',s.tasks_todo);setText('ts-doing',s.tasks_doing);setText('ts-logs',s.logs_total);
+  setText('gs-t',s.tasks_todo);setText('gs-prod',(s.products_active||s.products_total||0)+' activos');setText('gs-p',pct+'%');setText('gs-l',s.logs_total);
+  setText('g-st',(s.tasks_doing||0)+(s.tasks_todo||0));setText('g-prod',s.products_active||s.products_total||0);setText('g-sp',pct+'%');setText('g-sl',s.logs_total);
   setText('nb-dev',s.products_total||0);setText('slb-dev',s.products_total||0);
   const devTaskEl=document.getElementById('nb-dev-tasks');
   if(devTaskEl) devTaskEl.textContent=(s.tasks_doing||0)+' doing';
   setText('nb-str',s.logs_total||0);setText('slb-str',s.logs_total||0);
-}
-
-// ══ CRM ══
-function filterContacts(){crm_search=document.getElementById('crm-search').value.toLowerCase();renderCRM();}
-function renderCRM(){
-  const kb=document.getElementById('crm-kanban');
-  const vis=crm_search?STATE.contacts.filter(c=>(c.name+c.medio+c.empresa+c.notes).toLowerCase().includes(crm_search)):STATE.contacts;
-  kb.innerHTML='';
-  CRM_COLS.forEach(col=>{
-    const cards=vis.filter(c=>c.status===col.key);
-    const el=document.createElement('div');
-    el.className='kanban-col';
-    el.style.setProperty('--cc',col.color);
-    el.innerHTML=`<div class="kanban-col-head"><span class="kanban-col-name">${col.label}</span><span class="kanban-col-count">${cards.length}</span></div>
-      <div class="kanban-cards">${cards.length?cards.map(ccHTML).join(''):'<div style="padding:12px 8px;text-align:center;color:var(--text3);font-size:10px">Sin contactos</div>'}</div>`;
-    kb.appendChild(el);
-  });
-}
-function ccHTML(c){
-  const fu=c.next_followup?`<div class="cc-follow">📅 <span class="dv">${c.next_followup}</span></div>`:'';
-  const notes=c.notes?`<div class="cc-notes">${c.notes.slice(0,75)}${c.notes.length>75?'…':''}</div>`:'';
-  return `<div class="contact-card" onclick="openContactModal('${c.id}')">
-    <div class="cc-actions">
-      <button class="ca-btn" title="Avanzar" onclick="event.stopPropagation();advanceStatus('${c.id}')">▶</button>
-      <button class="ca-btn del" title="Eliminar" onclick="event.stopPropagation();quickDelContact('${c.id}')">✕</button>
-    </div>
-    <div class="cc-name">${c.name}</div>
-    <div class="cc-medio">${[c.medio,c.empresa].filter(Boolean).join(' · ')}</div>
-    <div class="cc-tags"><span class="tag tag-${c.tipo}">${c.tipo}</span></div>
-    ${fu}${notes}</div>`;
-}
-async function advanceStatus(id){
-  const c=STATE.contacts.find(x=>x.id===id);if(!c)return;
-  const keys=CRM_COLS.map(x=>x.key);
-  const next=keys[(keys.indexOf(c.status)+1)%keys.length];
-  try{await api(`/api/contacts/${id}/status`,'PATCH',{status:next});await loadContacts();await loadStats();renderCRM();renderStats();toast(`${c.name} → ${next}`,'info');}
-  catch(e){toast(e.message,'error');}
-}
-async function quickDelContact(id){
-  if(!confirm('¿Eliminar?'))return;
-  try{await api(`/api/contacts/${id}`,'DELETE');await loadContacts();await loadStats();renderCRM();renderStats();toast('Contacto eliminado','error');}
-  catch(e){toast(e.message,'error');}
-}
-function openContactModal(id=null){
-  const del=document.getElementById('contact-del-btn');
-  document.getElementById('contact-id').value='';
-  ['c-name','c-medio','c-empresa','c-email','c-telefono','c-notes','c-followup'].forEach(i=>{const el=document.getElementById(i);if(el)el.value='';});
-  document.getElementById('c-tipo').value='prensa';document.getElementById('c-status').value='nuevo';
-  if(id){
-    const c=STATE.contacts.find(x=>x.id===id);if(!c)return;
-    document.getElementById('contact-modal-title').textContent='Editar Contacto';
-    document.getElementById('contact-id').value=id;
-    ['name','medio','empresa','email','telefono','tipo','status'].forEach(k=>document.getElementById('c-'+k).value=c[k]||'');
-    document.getElementById('c-followup').value=c.next_followup||'';
-    document.getElementById('c-notes').value=c.notes||'';
-    del.style.display='block';
-  }else{document.getElementById('contact-modal-title').textContent='Nuevo Contacto';del.style.display='none';}
-  openModal('modal-contact');
-}
-async function saveContact(){
-  const name=document.getElementById('c-name').value.trim();if(!name){shake('c-name');return;}
-  const id=document.getElementById('contact-id').value;
-  const data={name,medio:v('c-medio'),empresa:v('c-empresa'),email:v('c-email'),telefono:v('c-telefono'),
-    tipo:v('c-tipo'),status:v('c-status'),next_followup:v('c-followup'),
-    last_contact:new Date().toISOString().slice(0,10),notes:v('c-notes')};
-  try{
-    if(id){await api(`/api/contacts/${id}`,'PUT',data);toast('Contacto actualizado','success');}
-    else{await api('/api/contacts','POST',data);toast('Contacto creado','success');}
-    closeModal('modal-contact');await loadContacts();await loadStats();renderCRM();renderStats();
-  }catch(e){toast(e.message,'error');}
-}
-async function deleteContact(){
-  const id=document.getElementById('contact-id').value;if(!id||!confirm('¿Eliminar?'))return;
-  try{await api(`/api/contacts/${id}`,'DELETE');closeModal('modal-contact');await loadContacts();await loadStats();renderCRM();renderStats();toast('Eliminado','error');}
-  catch(e){toast(e.message,'error');}
 }
 
 // ══ DEV ══
@@ -2124,8 +1897,7 @@ function toast(msg,type='info'){
 document.addEventListener('keydown',e=>{
   if(e.key==='Escape'){document.querySelectorAll('.overlay.open').forEach(o=>o.classList.remove('open'));return;}
   if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA'||e.target.tagName==='SELECT')return;
-  if(e.key==='/'){switchPanel('crm');setTimeout(()=>document.getElementById('crm-search').focus(),50);}
-  const map={'1':'crm','2':'dev','3':'campaign','4':'strategy','5':'guide'};
+  const map={'1':'dev','2':'campaign','3':'strategy','4':'guide'};
   if(map[e.key])switchPanel(map[e.key]);
 });
 // ══ CHATBOT ══
@@ -2241,6 +2013,6 @@ def index():
 
 if __name__ == '__main__':
     print("\n  OpenAETH Command Core — MongoDB + Groq AI")
-    print(f"  DB: {MONGODB_DB}  |  Groq: {'✓' if groq_client else '✗'}")
+    print(f"  DB: {MONGODB_DB}  |  Groq: {'✓' if groq_client else '✗'}  |  Modelo: {GROQ_MODEL}")
     print("  → http://localhost:5000\n")
     app.run(debug=False, host='0.0.0.0', port=5000)

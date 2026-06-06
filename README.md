@@ -1,6 +1,6 @@
 # OpenAETH — Command Core
 
-Panel de operaciones para startups. Gestiona CRM de prensa y partners, backlog de desarrollo, métricas de campañas y logs estratégicos desde una única interfaz web sin dependencias de frontend.
+Panel de operaciones para startups, centrado en **gestión de desarrollo con IA integrada**. Administra el backlog de productos y tareas (módulo DEV), métricas de campaña vinculadas al cumplimiento de DEV y logs estratégicos — todo desde una única interfaz web sin build step, con un asistente IA que opera el sistema por chat.
 
 ---
 
@@ -10,9 +10,9 @@ Panel de operaciones para startups. Gestiona CRM de prensa y partners, backlog d
 |---|---|
 | Web framework | Flask 3.1 |
 | WSGI server | Gunicorn 23 (2 workers, timeout 120 s) |
-| ORM / query | SQLAlchemy 2.0 (Core, sin ORM declarativo) |
-| Driver DB | psycopg2-binary 2.9 |
-| Base de datos | PostgreSQL vía Supabase |
+| Driver DB | PyMongo 4.10 |
+| Base de datos | MongoDB (Atlas, vía `MONGODB_URI`) |
+| IA / Chatbot | Groq · modelo `qwen/qwen3-32b` (function calling + reasoning) |
 | Frontend | HTML/CSS/JS embebido en `app.py` (sin build step) |
 | Charts | Chart.js 4.4 (CDN) |
 | Deploy | Render (Web Service, Python runtime) |
@@ -27,60 +27,41 @@ Panel de operaciones para startups. Gestiona CRM de prensa y partners, backlog d
 │                  Render                      │
 │  Gunicorn → Flask app (app.py)               │
 │    ├── REST API  /api/*                      │
+│    ├── Chatbot   /api/chat  (Groq tools)     │
 │    └── Frontend  GET /  (HTML inline)        │
-└────────────────────┬────────────────────────┘
-                     │ SSL/TLS + IPv4 forzado
-         ┌───────────▼────────────┐
-         │   Supabase (PostgreSQL) │
-         │   Pooler: puerto 5432   │
-         └────────────────────────┘
+└──────────┬───────────────────────┬───────────┘
+           │ TLS (certifi)         │ HTTPS
+   ┌───────▼────────┐      ┌────────▼────────┐
+   │ MongoDB Atlas  │      │   Groq API      │
+   │ db: commandc.  │      │ qwen/qwen3-32b  │
+   └────────────────┘      └─────────────────┘
 ```
 
-El frontend es un SPA de página única servido directamente por Flask como string HTML. No existe un proceso de build ni archivos estáticos separados.
+El frontend es un SPA de página única servido directamente por Flask como string HTML. No existe proceso de build ni archivos estáticos separados.
 
 ---
 
-## Solución al problema IPv6 / Render → Supabase
+## Asistente IA (chatbot)
 
-Render resuelve hostnames de Supabase como IPv6, pero el pooler de Supabase solo acepta IPv4. La conexión se establece mediante un `creator` personalizado pasado a SQLAlchemy:
+El endpoint `/api/chat` expone un agente Groq con function calling. Las herramientas son **self-contained** (buscan productos por nombre internamente, sin pasar IDs entre rondas), lo que evita races al crear producto + tareas en paralelo.
 
-```python
-def _make_ipv4_connection():
-    ipv4 = socket.getaddrinfo(host, port, socket.AF_INET)[0][4][0]
-    return psycopg2.connect(
-        host=p['host'],    # hostname real → SNI correcto en TLS
-        hostaddr=ipv4,     # IP IPv4 → evita el DNS lookup que devuelve IPv6
-        sslmode='require',
-        ...
-    )
+Herramientas disponibles:
 
-engine = create_engine(
-    "postgresql+psycopg2://",
-    creator=_make_ipv4_connection,
-    pool_size=5,
-    max_overflow=10,
-    pool_pre_ping=True,
-    pool_recycle=300,
-)
-```
+| Tool | Qué hace |
+|---|---|
+| `create_product_with_tasks` | Crea un producto y todas sus tareas en una operación atómica |
+| `add_tasks_to_product` | Agrega tareas a un producto existente (búsqueda por nombre) |
+| `list_products` | Lista productos con id, nombre y estado |
+| `list_tasks` | Lista tareas, opcionalmente filtradas por producto |
+| `update_tasks` | Actualiza tareas por nombre + producto (sin IDs) |
 
-`host` transporta el SNI para la autenticación TLS; `hostaddr` fuerza la IP resuelta. Sin ambos parámetros simultáneos la conexión falla.
+El modelo `qwen/qwen3-32b` es un modelo *reasoning*: emite bloques `<think>…</think>`. La app los oculta vía `reasoning_format="hidden"` y, como red de seguridad, los limpia con `strip_think()` antes de devolver la respuesta.
 
 ---
 
 ## API REST
 
 Todos los endpoints responden y consumen `application/json`. No hay autenticación (la app asume red privada o acceso controlado vía Render).
-
-### Contacts
-
-| Método | Ruta | Descripción |
-|--------|------|-------------|
-| GET | `/api/contacts` | Lista todos, ordenados por `updated_at DESC` |
-| POST | `/api/contacts` | Crea contacto |
-| PUT | `/api/contacts/<id>` | Actualización completa |
-| DELETE | `/api/contacts/<id>` | Elimina contacto e interacciones en cascada |
-| PATCH | `/api/contacts/<id>/status` | Actualiza solo el campo `status` |
 
 ### Products
 
@@ -114,102 +95,90 @@ Todos los endpoints responden y consumen `application/json`. No hay autenticaci�
 
 | Método | Ruta | Descripción |
 |--------|------|-------------|
-| GET | `/api/logs` | Lista logs ordenados por `created_at DESC`; `links` deserializado como array |
-| POST | `/api/logs` | Crea log; `links` se serializa como JSON string en DB |
+| GET | `/api/logs` | Lista logs ordenados por `created_at DESC` |
+| POST | `/api/logs` | Crea log (`type`, `title`, `text`, `links`, `date`) |
 | DELETE | `/api/logs/<id>` | Elimina log |
 
-### Utilidades
+### Chat & utilidades
 
 | Método | Ruta | Descripción |
 |--------|------|-------------|
-| GET | `/api/stats` | Devuelve contadores agregados de todas las tablas |
-| GET | `/api/health` | Verifica conexión a DB e informa la IP IPv4 resuelta |
+| POST | `/api/chat` | Agente Groq con tools sobre productos/tareas |
+| GET | `/api/stats` | Contadores agregados (tasks, productos, logs) |
+| GET | `/api/health` | Verifica conexión a Mongo y disponibilidad de Groq |
 | GET | `/` | Sirve el frontend HTML completo |
 
 ---
 
-## Schema de base de datos
+## Colecciones MongoDB
 
 ```
-contacts              products
-├─ id (PK)            ├─ id (PK)
-├─ name               ├─ name
-├─ medio              ├─ icon
-├─ empresa            ├─ description
-├─ tipo               ├─ status
-├─ status             ├─ color
-├─ email              ├─ sort_order
-├─ telefono           └─ created_at / updated_at
-├─ last_contact
-├─ next_followup      tasks
-├─ notes              ├─ id (PK)
-└─ created_at /       ├─ product_id (FK → products)
-   updated_at         ├─ module
-                      ├─ name
-contact_interactions  ├─ description
-├─ id (PK)            ├─ status  (todo | doing | done)
-├─ contact_id (FK)    ├─ priority
-├─ type               ├─ impact
-├─ note               ├─ done  (0 | 1)
-└─ date               └─ created_at / updated_at
-
-campaigns             strategy_logs
-├─ id (PK)            ├─ id (PK)
-├─ name               ├─ type  (Decision | Insight | Riesgo | Oportunidad)
-├─ icon               ├─ title
-├─ visitas            ├─ text
-├─ conversion         ├─ links  (JSON string → array)
-├─ leads              ├─ date
-├─ backers            └─ created_at
-└─ notes
+products                 tasks
+├─ _id                   ├─ _id
+├─ name                  ├─ product_id  (str → products._id)
+├─ icon                  ├─ module
+├─ description           ├─ name
+├─ status                ├─ description
+├─ color                 ├─ status   (todo | doing | done)
+├─ sort_order            ├─ priority (alto | medio | bajo)
+└─ created_at/updated_at ├─ impact   (alto | medio | bajo)
+                         ├─ done     (0 | 1)
+campaigns                └─ created_at/updated_at
+├─ _id
+├─ name                  strategy_logs
+├─ icon                  ├─ _id
+├─ visitas               ├─ type  (Decision | Insight | Riesgo | Oportunidad)
+├─ conversion            ├─ title
+├─ leads                 ├─ text
+├─ backers               ├─ links  (array)
+├─ notes                 ├─ date
+└─ created_at/updated_at └─ created_at
 ```
 
-Índices definidos sobre `contacts.updated_at`, `tasks.product_id`, `tasks.status`, `strategy_logs.created_at` y `contact_interactions.contact_id`.
+> La colección `contacts` (del antiguo módulo CRM, migrado a otra aplicación) puede existir en la base pero **ya no es usada** por esta app.
 
 ---
 
 ## Variables de entorno
 
-| Variable | Descripción | Requerida |
-|---|---|---|
-| `DATABASE_URL` | Connection string PostgreSQL completo | Sí |
-| `PORT` | Puerto de escucha (inyectado por Render automáticamente) | Sí (auto) |
-
-Formato esperado de `DATABASE_URL`:
-```
-postgresql://postgres.bgjjmeenermkwxqewaml:mypassword@aws-0-us-west-2.pooler.supabase.com:5432/postgres 
-```
+| Variable | Descripción | Requerida | Default |
+|---|---|---|---|
+| `MONGODB_URI` | Connection string de MongoDB Atlas | Sí | — |
+| `MONGODB_DB` | Nombre de la base | No | `commandcenter` |
+| `GROQ_API_KEY` | API key de Groq (habilita el chatbot) | No | — |
+| `GROQ_MODEL` | Modelo Groq a usar | No | `qwen/qwen3-32b` |
+| `PORT` | Puerto de escucha (inyectado por Render) | Sí (auto) | — |
 
 ---
 
 ## Deploy en Render
 
-La configuración está declarada en `render.yaml`:
+Configuración declarada en `render.yaml`:
 
 - **Runtime:** Python 3.11
 - **Build:** `pip install -r requirements.txt`
 - **Start:** `gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120`
-- La variable `DATABASE_URL` debe setearse manualmente en el dashboard de Render (marcada como `sync: false`).
+- `MONGODB_URI`, `MONGODB_DB` y `GROQ_API_KEY` se setean manualmente en el dashboard (`sync: false`). `GROQ_MODEL` viene con default en el YAML.
 
 ---
 
 ## Setup local
 
 ```bash
-# 1. Clonar y crear entorno virtual
+# 1. Crear entorno virtual
 python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
 
 # 2. Instalar dependencias
 pip install -r requirements.txt
 
-# 3. Configurar variable de entorno
-export DATABASE_URL="postgresql://USER:PASSWORD@HOST:PORT/DBNAME"
+# 3. Configurar variables de entorno
+export MONGODB_URI="mongodb+srv://USER:PASSWORD@CLUSTER/?retryWrites=true&w=majority"
+export MONGODB_DB="commandcenter"
+export GROQ_API_KEY="gsk_..."          # opcional, habilita el chatbot
+export GROQ_MODEL="qwen/qwen3-32b"     # opcional
 
-# 4. Ejecutar el schema en Supabase (SQL Editor)
-# → copiar y ejecutar supabase_schema.sql
-
-# 5. Iniciar servidor de desarrollo
+# 4. Iniciar servidor de desarrollo
 python app.py
 # → http://localhost:5000
 ```
@@ -218,13 +187,12 @@ python app.py
 
 ## Paneles del frontend
 
-El SPA incluye cinco secciones navegables por teclado (`1`–`5`) o clic:
+El SPA incluye cuatro secciones navegables por teclado (`1`–`4`) o clic, más el asistente IA flotante (🤖):
 
-- **CRM** (`1` o `/` para buscar) — Gestión de contactos de prensa, partners y clientes con estados y seguimiento
-- **DEV** (`2`) — Backlog de tareas agrupadas por producto y módulo, con toggle de completado
-- **Campañas** (`3`) — Métricas por canal (visitas, conversión, leads, backers) con gráficos Chart.js
-- **Estrategia** (`4`) — Log de decisiones, insights, riesgos y oportunidades con filtrado por tipo
-- **Guía** (`5`) — Panel de referencia interno
+- **DEV** (`1`) — Backlog de tareas agrupadas por producto y módulo, con toggle de completado y progreso en tiempo real. Panel por defecto.
+- **Campaña** (`2`) — Métricas por canal (visitas, conversión, leads, backers) con gráficos Chart.js.
+- **Estrategia** (`3`) — Log de decisiones, insights, riesgos y oportunidades con filtrado por tipo.
+- **Guía** (`4`) — Panel de referencia interno.
 
 ---
 
@@ -232,9 +200,8 @@ El SPA incluye cinco secciones navegables por teclado (`1`–`5`) o clic:
 
 ```
 .
-├── app.py               # Aplicación completa (API + frontend embebido)
-├── requirements.txt     # Dependencias Python
-├── render.yaml          # Configuración de deploy en Render
-├── supabase_schema.sql  # DDL + datos de seed para Supabase
+├── app.py            # Aplicación completa (API + chatbot + frontend embebido)
+├── requirements.txt  # Dependencias Python
+├── render.yaml       # Configuración de deploy en Render
 └── .gitignore
 ```
