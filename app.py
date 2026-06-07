@@ -963,6 +963,7 @@ HTML = """
 <title>OpenAETH — Command Core</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet"/>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@5.2.3/marked.min.js"></script>
 <style>
 :root {
   --bg0:#06090d; --bg1:#0b1017; --bg2:#0f1722; --bg3:#141f2e; --bg4:#1a2740;
@@ -1347,6 +1348,23 @@ input,select,textarea{font-family:inherit;}
 .chat-tool-badge{display:inline-flex;align-items:center;gap:4px;font-size:9px;
   color:var(--purple-light);background:var(--purple-dim);border:1px solid rgba(124,63,255,.3);
   border-radius:3px;padding:1px 6px;margin-top:3px;}
+/* ══ CHAT MARKDOWN ══ */
+.chat-bubble p{margin:0 0 6px}
+.chat-bubble p:last-child{margin-bottom:0}
+.chat-bubble ul,.chat-bubble ol{margin:4px 0;padding-left:18px}
+.chat-bubble li{margin-bottom:2px}
+.chat-bubble code{background:var(--bg3);padding:1px 5px;border-radius:3px;font-family:var(--mono);font-size:11px;color:var(--purple-light)}
+.chat-bubble pre{background:rgba(0,0,0,.25);padding:8px 10px;border-radius:6px;overflow-x:auto;margin:6px 0;border:1px solid var(--border2)}
+.chat-bubble pre code{background:none;padding:0;font-size:11px;color:inherit}
+.chat-bubble blockquote{border-left:2px solid var(--purple);padding:2px 10px;margin:6px 0;color:var(--text2)}
+.chat-bubble h1,.chat-bubble h2,.chat-bubble h3,.chat-bubble h4,.chat-bubble h5,.chat-bubble h6{margin:8px 0 4px;font-weight:700;line-height:1.3;font-family:var(--sans)}
+.chat-bubble h1{font-size:14px}.chat-bubble h2{font-size:13px}.chat-bubble h3{font-size:12px}
+.chat-bubble h4,.chat-bubble h5,.chat-bubble h6{font-size:11px}
+.chat-bubble a{color:var(--purple-light);text-decoration:underline}
+.chat-bubble hr{border:none;border-top:1px solid var(--border2);margin:8px 0}
+.chat-bubble table{border-collapse:collapse;width:100%;margin:6px 0;font-size:11px}
+.chat-bubble th,.chat-bubble td{border:1px solid var(--border2);padding:4px 6px;text-align:left}
+.chat-bubble th{background:var(--bg3);font-weight:700}
 </style>
 </head>
 <body>
@@ -2138,15 +2156,17 @@ function toggleChat(){
 }
 
 function appendMsg(role,html){
-  chatHistory.push({role:role==='user'?'user':'assistant',content:html.replace(/<[^>]+>/g,'')});
+  const isBot=role!=='user';
+  chatHistory.push({role:isBot?'assistant':'user',content:html.replace(/<[^>]+>/g,'')});
+  const rendered=isBot?marked.parse(html):html;
   const wrap=document.getElementById('chat-messages');
   const div=document.createElement('div');
-  div.className='chat-msg '+(role==='user'?'user':'bot');
-  div.innerHTML=`<div class="chat-bubble">${html}</div>`;
+  div.className='chat-msg '+(isBot?'bot':'user');
+  div.innerHTML=`<div class="chat-bubble">${rendered}</div>`;
   wrap.appendChild(div);
   wrap.scrollTop=wrap.scrollHeight;
   const saved=JSON.parse(localStorage.getItem('aethyChat')||'[]');
-  saved.push({role:role==='user'?'user':'assistant',html});
+  saved.push({role:isBot?'assistant':'user',html:rendered});
   if(saved.length>50)saved.splice(0,saved.length-50);
   localStorage.setItem('aethyChat',JSON.stringify(saved));
 }
