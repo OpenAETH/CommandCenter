@@ -1827,7 +1827,7 @@ function renderDev(){
     let modHtml='';
     if(state.open){
       modules.forEach((mod,mi)=>{
-        if(!state.modules[mod]) state.modules[mod]=true;
+        if(state.modules[mod]===undefined) state.modules[mod]=true;
         const mtasks=ptasks.filter(t=>t.module===mod);
         const mdone=mtasks.filter(t=>t.done).length;
         const mpct=mtasks.length?Math.round(mdone/mtasks.length*100):0;
