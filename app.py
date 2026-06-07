@@ -963,7 +963,7 @@ HTML = """
 <title>OpenAETH — Command Core</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet"/>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/marked@5.2.3/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/5.2.0/marked.min.js"></script>
 <style>
 :root {
   --bg0:#06090d; --bg1:#0b1017; --bg2:#0f1722; --bg3:#141f2e; --bg4:#1a2740;
