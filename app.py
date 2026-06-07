@@ -2175,8 +2175,8 @@ async function sendChat(){
     hideTyping();
     appendMsg('bot',data.response||'Acción completada.');
     if(data.refresh){
-      await Promise.all([loadProducts(),loadTasks(),loadStats(),loadDevMetrics()]);
-      renderDev();renderStats();renderCampaign();
+      await Promise.all([loadProducts(),loadTasks(),loadStats(),loadDevMetrics(),loadLogs()]);
+      renderDev();renderStats();renderCampaign();renderStrategy();
       toast('Sistema actualizado','success');
     }
   }catch(e){
