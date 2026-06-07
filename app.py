@@ -2158,7 +2158,7 @@ function toggleChat(){
 function appendMsg(role,html){
   const isBot=role!=='user';
   chatHistory.push({role:isBot?'assistant':'user',content:html.replace(/<[^>]+>/g,'')});
-  const rendered=isBot?marked.parse(html):html;
+  let rendered;try{rendered=isBot?marked.parse(html):html}catch(e){rendered=html}
   const wrap=document.getElementById('chat-messages');
   const div=document.createElement('div');
   div.className='chat-msg '+(isBot?'bot':'user');
