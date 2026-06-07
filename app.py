@@ -1314,6 +1314,9 @@ input,select,textarea{font-family:inherit;}
 .chat-head-sub{font-size:9px;color:var(--text2);letter-spacing:.07em;text-transform:uppercase;}
 .chat-online{width:7px;height:7px;border-radius:50%;background:var(--green);
   box-shadow:0 0 8px var(--green);flex-shrink:0;}
+.chat-clear{background:none;border:none;color:var(--text2);cursor:pointer;font-size:14px;
+  padding:4px;border-radius:6px;transition:all .15s;line-height:1;}
+.chat-clear:hover{color:var(--red,#ef4444);background:rgba(239,68,68,.1);}
 .chat-messages{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;
   gap:8px;min-height:80px;}
 .chat-msg{display:flex;flex-direction:column;}
@@ -2142,6 +2145,10 @@ function appendMsg(role,html){
   div.innerHTML=`<div class="chat-bubble">${html}</div>`;
   wrap.appendChild(div);
   wrap.scrollTop=wrap.scrollHeight;
+  const saved=JSON.parse(localStorage.getItem('aethyChat')||'[]');
+  saved.push({role:role==='user'?'user':'assistant',html});
+  if(saved.length>50)saved.splice(0,saved.length-50);
+  localStorage.setItem('aethyChat',JSON.stringify(saved));
 }
 
 function showTyping(){
@@ -2186,7 +2193,26 @@ async function sendChat(){
   }
 }
 
+function clearChat(){
+  if(!confirm('¿Limpiar todo el historial de AETHY?'))return;
+  chatHistory=[];
+  document.getElementById('chat-messages').innerHTML='';
+  localStorage.removeItem('aethyChat');
+  toast('Historial limpiado','info');
+}
+
 document.addEventListener('DOMContentLoaded',()=>{
+  const saved=JSON.parse(localStorage.getItem('aethyChat')||'[]');
+  saved.forEach(({role,html})=>{
+    chatHistory.push({role,content:html.replace(/<[^>]+>/g,'')});
+    const wrap=document.getElementById('chat-messages');
+    if(!wrap)return;
+    const div=document.createElement('div');
+    div.className='chat-msg '+(role==='user'?'user':'bot');
+    div.innerHTML=`<div class="chat-bubble">${html}</div>`;
+    wrap.appendChild(div);
+  });
+  if(saved.length)document.getElementById('chat-messages').scrollTop=9999;
   const ci=document.getElementById('chat-input');
   if(ci){
     ci.addEventListener('keydown',e=>{
@@ -2212,6 +2238,7 @@ boot();
       <div class="chat-head-sub">Asistente IA · Qwen3-32B</div>
     </div>
     <div class="chat-online"></div>
+    <button class="chat-clear" onclick="clearChat()" title="Limpiar historial">🗑</button>
   </div>
   <div class="chat-messages" id="chat-messages"></div>
   <div class="chat-input-wrap">
