@@ -1378,6 +1378,96 @@ input,select,textarea{font-family:inherit;}
 .chat-bubble table{border-collapse:collapse;width:100%;margin:6px 0;font-size:11px}
 .chat-bubble th,.chat-bubble td{border:1px solid var(--border2);padding:4px 6px;text-align:left}
 .chat-bubble th{background:var(--bg3);font-weight:700}
+
+/* ===== RESPONSIVE — REGISTRO =====
+   ledger: P1=done P2=done P3=done P4=done P5=done P6=done P7=done
+   Cada fase voltea su tag a =done y añade su marcador abajo.
+   Cascada mobile-last: desktop -> mas estrecho. Todo gateado tras @media. */
+
+/* [P7] base: hamburguesa y scrim ocultos en desktop */
+.hamburger{display:none;}
+.sidebar-scrim{display:none;}
+
+/* ── TABLET <=1024 ── */
+@media (max-width:1024px){
+  /* [P1] sidebar off-canvas <=768 (preludio: encoge a 1024) */
+  .sidebar{width:170px;}
+  .topbar-brand{width:170px;}
+  /* [P3] grids -> 1col (campaign 2col->1, guide 3col->2) */
+  .campaign-layout{grid-template-columns:1fr;}
+  .guide-grid{grid-template-columns:repeat(2,1fr);}
+  /* mitigacion overflow anidado: el panel scrollea como un todo */
+  #panel-campaign.active{overflow-y:auto;}
+  .campaign-layout{overflow:visible;}
+  .campaign-left,.campaign-right{overflow:visible;border-right:none;}
+  .camp-cards-wrap,.cr-body{overflow:visible;flex:none;}
+  /* [P4] topbar 1-row, nav hidden <=768 (preludio: compacta a 1024) */
+  .topbar-clock{display:none;}
+  .nav-tab{padding:0 9px;font-size:10px;}
+}
+
+/* ── MOBILE <=768 ── */
+@media (max-width:768px){
+  /* [P1] sidebar off-canvas <=768 */
+  .sidebar{position:fixed;top:50px;left:0;bottom:0;width:240px;z-index:600;
+    transform:translateX(-100%);transition:transform .22s ease;box-shadow:var(--shadow-lg);}
+  .sidebar.open{transform:translateX(0);}
+  .topbar-brand{width:auto;border-right:none;padding:0 12px;}
+  .sidebar-scrim.open{display:block;position:fixed;inset:50px 0 0 0;
+    background:rgba(0,0,0,.5);z-index:550;}
+  /* [P2] chat/modal/toast fluid */
+  .chat-panel{width:340px;}
+  /* [P3] grids -> 1col */
+  .camp-charts{grid-template-columns:1fr;}
+  .guide-grid{grid-template-columns:1fr;}
+  .guide-hero{flex-direction:column;align-items:flex-start;gap:16px;}
+  .guide-hero-right{min-width:0;width:100%;flex-direction:row;flex-wrap:wrap;}
+  /* [P7] hamburguesa visible */
+  .hamburger{display:flex;align-items:center;justify-content:center;width:38px;height:38px;
+    background:none;border:none;color:var(--text0);font-size:18px;cursor:pointer;flex-shrink:0;}
+  /* [P4] topbar 1-row, nav hidden <=768 */
+  .topbar-nav{display:none;}
+  .topbar-stat:nth-child(2),.topbar-stat:nth-child(3){display:none;}
+  .topbar-right{gap:8px;}
+  /* [P6] typo/spacing + red de overflow */
+  html,body{overflow-x:hidden;}
+  .panel-header{padding:10px 12px;flex-wrap:wrap;gap:6px;}
+  .dev-task{padding-left:16px;}
+  .guide-body,.strategy-body{padding:12px;}
+  .camp-metrics-bar{gap:6px;}
+}
+
+/* ── SMALL MOBILE <=480 ── */
+@media (max-width:480px){
+  /* [P2] chat/modal/toast fluid */
+  .chat-panel{width:calc(100vw - 24px);left:12px;right:12px;max-height:70vh;bottom:76px;}
+  .chat-fab{bottom:16px;right:16px;}
+  .toast-wrap{left:12px;right:12px;bottom:12px;}
+  .toast{min-width:0;width:100%;}
+  .modal{width:100%;max-height:92vh;}
+  .modal-body{padding:14px;}
+  .f-row{grid-template-columns:1fr;}
+  /* [P3] grids -> 1col */
+  .status-grid{grid-template-columns:1fr;}
+  /* [P4] topbar 1-row, nav hidden <=768 (small: oculta stats) */
+  .topbar-right{display:none;}
+  /* [P5] touch actions visible (small) */
+  .btn{padding:8px 12px;}
+  /* [P6] typo/spacing: reduce numericos grandes */
+  .mc-val{font-size:18px;}
+  .status-val{font-size:22px;}
+  .guide-hero-title{font-size:16px;}
+}
+
+/* ── TOUCH (sin hover / puntero grueso) ── */
+@media (hover:none),(pointer:coarse){
+  /* [P5] touch actions visible: acciones hover-only siempre mostradas */
+  .dt-actions{display:flex!important;}
+  .log-del{display:flex!important;}
+  .nav-tab,.sidebar-link,.btn,.modal-close,.chat-send{min-height:38px;}
+  .dtc{width:18px;height:18px;}
+}
+/* ===== /RESPONSIVE ===== */
 </style>
 </head>
 <body>
@@ -1389,6 +1479,7 @@ input,select,textarea{font-family:inherit;}
     <div class="brand-dot"></div>
     <div><div class="brand-name">OPENAETH</div><div class="brand-version">COMMAND CORE v2.1</div></div>
   </div>
+  <button class="hamburger" id="hamburger" aria-label="Menú" aria-expanded="false" onclick="toggleSidebar()">☰</button>
   <div class="topbar-nav">
     <button class="nav-tab active" style="--tab-color:var(--orange)" data-panel="dev" onclick="switchPanel('dev',this)">
       ⚙️ DEV <span class="nav-badge" id="nb-dev" style="background:var(--orange)">0</span><span id="nb-dev-tasks" style="font-size:9px;color:var(--text2);margin-left:2px"></span>
@@ -1446,6 +1537,7 @@ input,select,textarea{font-family:inherit;}
     </div>
   </div>
 </div>
+<div class="sidebar-scrim" id="sidebar-scrim" onclick="closeSidebar()"></div>
 
 <!-- MAIN -->
 <div class="main">
@@ -1807,6 +1899,25 @@ function switchPanel(name,btnEl){
   document.querySelectorAll('.sidebar-link').forEach(b=>b.classList.remove('active'));
   document.getElementById('sl-'+name)?.classList.add('active');
   if(name==='campaign') loadDevMetrics().then(()=>renderCampaign()).catch(()=>renderCharts());
+  closeSidebar();
+}
+
+/* [P7] drawer JS: hamburger+scrim+switchPanel close */
+function toggleSidebar(){
+  const sb=document.querySelector('.sidebar');
+  const scrim=document.getElementById('sidebar-scrim');
+  const hb=document.getElementById('hamburger');
+  const open=!sb.classList.contains('open');
+  sb.classList.toggle('open',open);
+  scrim?.classList.toggle('open',open);
+  hb?.setAttribute('aria-expanded',open?'true':'false');
+}
+function closeSidebar(){
+  const sb=document.querySelector('.sidebar');
+  if(!sb||!sb.classList.contains('open'))return;
+  sb.classList.remove('open');
+  document.getElementById('sidebar-scrim')?.classList.remove('open');
+  document.getElementById('hamburger')?.setAttribute('aria-expanded','false');
 }
 
 // stats
@@ -2147,7 +2258,7 @@ function toast(msg,type='info'){
   wrap.appendChild(el);setTimeout(()=>el.remove(),3100);
 }
 document.addEventListener('keydown',e=>{
-  if(e.key==='Escape'){document.querySelectorAll('.overlay.open').forEach(o=>o.classList.remove('open'));return;}
+  if(e.key==='Escape'){document.querySelectorAll('.overlay.open').forEach(o=>o.classList.remove('open'));closeSidebar();return;}
   if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA'||e.target.tagName==='SELECT')return;
   const map={'1':'dev','2':'campaign','3':'strategy','4':'guide'};
   if(map[e.key])switchPanel(map[e.key]);
