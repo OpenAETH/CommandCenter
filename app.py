@@ -1488,14 +1488,16 @@ input,select,textarea{font-family:inherit;}
   .modal-body{padding:14px;}
   .f-row{grid-template-columns:1fr;}
   /* [P3] grids -> 1col */
-  .status-grid{grid-template-columns:1fr;}
+  .status-grid{grid-template-columns:repeat(3,1fr);gap:4px;}
+  .status-card{padding:10px 6px;}
+  .status-val{font-size:18px;}
+  .status-lbl{font-size:8px;}
   /* [P4] topbar 1-row, nav hidden <=768 (small: oculta stats) */
   .topbar-right{display:none;}
   /* [P5] touch actions visible (small) */
   .btn{padding:8px 12px;}
   /* [P6] typo/spacing: reduce numericos grandes */
   .mc-val{font-size:18px;}
-  .status-val{font-size:22px;}
   .guide-hero-title{font-size:16px;}
   /* [P9] bottom sheet modals */
   .overlay{align-items:flex-end;padding:0;}
@@ -1521,6 +1523,7 @@ input,select,textarea{font-family:inherit;}
     gap:4px;padding:7px 10px;background:var(--bg2);border-bottom:1px solid var(--border);}
 }
 /* ===== /RESPONSIVE ===== */
+.mobile-bottom-nav.hidden{display:none;}
 </style>
 </head>
 <body>
@@ -1600,10 +1603,10 @@ input,select,textarea{font-family:inherit;}
     <div class="panel-header">
       <div class="panel-title" style="color:var(--orange)">⚙️ DEV <span class="panel-sub">— Portafolio de productos</span></div>
       <div class="panel-actions">
-        <button class="btn" onclick="expandAllProducts()">Expandir todo</button>
-        <button class="btn" onclick="collapseAllProducts()">Colapsar todo</button>
-        <button class="btn" onclick="openProductModal()">+ Producto</button>
-        <button class="btn btn-primary" onclick="openTaskModal()">+ Task</button>
+        <button class="btn btn-sm" onclick="expandAllProducts()">Expandir todo</button>
+        <button class="btn btn-sm" onclick="collapseAllProducts()">Colapsar todo</button>
+        <button class="btn btn-sm" onclick="openProductModal()">+ Producto</button>
+        <button class="btn btn-sm btn-primary" onclick="openTaskModal()">+ Task</button>
       </div>
     </div>
     <div class="dev-wrap">
@@ -2365,8 +2368,14 @@ async function deleteLog(id){
 }
 
 // modals
-function openModal(id){document.getElementById(id).classList.add('open');}
-function closeModal(id){document.getElementById(id).classList.remove('open');}
+function openModal(id){
+  document.getElementById(id).classList.add('open');
+  document.getElementById('mobile-bottom-nav')?.classList.add('hidden');
+}
+function closeModal(id){
+  document.getElementById(id).classList.remove('open');
+  document.getElementById('mobile-bottom-nav')?.classList.remove('hidden');
+}
 function overlayClose(e,id){if(e.target.id===id)closeModal(id);}
 function v(id){return document.getElementById(id).value;}
 function shake(id){
