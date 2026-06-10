@@ -1410,11 +1410,7 @@ input,select,textarea{font-family:inherit;}
 .mb-badge{position:absolute;top:2px;right:2px;background:var(--tab-color,var(--orange));
   color:var(--bg0);font-size:8px;font-weight:700;padding:1px 4px;
   border-radius:2px;min-width:15px;text-align:center;line-height:1.3;}
-/* ══ SWIPE-TO-REVEAL — base styles ══ */
-.dev-task-wrap{position:relative;overflow:hidden;}
-.dev-task-reveal{position:absolute;right:0;top:0;bottom:0;display:none;
-  align-items:flex-start;gap:4px;padding:7px 10px;background:var(--bg2);}
-.dev-task{position:relative;z-index:1;background:var(--bg0);}
+
 
 /* ── TABLET <=1024 ── */
 @media (max-width:1024px){
@@ -1475,6 +1471,13 @@ input,select,textarea{font-family:inherit;}
   .dev-body,.strategy-body,.guide-body,.camp-cards-wrap,.cr-body{padding-bottom:56px;}
   /* panel-actions wrap para filtros de estrategia */
   .panel-actions{flex-wrap:wrap;gap:4px;}
+  /* campaña: padding derecho y bottom contra el nav */
+  .campaign-layout{padding:0 12px 0 12px;}
+  .campaign-left{border-right:none;}
+  .campaign-right{border-top:1px solid var(--border);padding:0 0 56px 0;}
+  .camp-metrics-bar{padding:12px 0;}
+  .camp-charts{padding:12px 0;}
+  .camp-cards-wrap{padding:12px 0 56px 0;}
 }
 
 /* ── SMALL MOBILE <=480 ── */
@@ -1515,15 +1518,10 @@ input,select,textarea{font-family:inherit;}
   .dtc{width:18px;height:18px;}
   /* [P10] touch targets mas grandes para acciones */
   .ca-btn{width:32px;height:32px;font-size:12px;}
-  /* [P10] swipe mechanic */
-  .dev-task-wrap{overflow:hidden;position:relative;touch-action:pan-y;}
-  .dev-task{transition:transform .25s ease;position:relative;z-index:1;background:var(--bg0);}
-  .dev-task.swiped{transform:translateX(-80px);}
-  .dev-task-reveal{position:absolute;right:0;top:0;bottom:0;display:flex;align-items:flex-start;
-    gap:4px;padding:7px 10px;background:var(--bg2);border-bottom:1px solid var(--border);}
+
 }
 /* ===== /RESPONSIVE ===== */
-.mobile-bottom-nav.hidden{display:none;}
+.chat-fab.modal-open{bottom:auto;top:16px;right:16px;}
 </style>
 </head>
 <body>
@@ -2004,38 +2002,6 @@ function closeSidebar(){
   document.getElementById('hamburger')?.setAttribute('aria-expanded','false');
 }
 
-/* [P10] swipe-to-reveal: touch events on tasks */
-(function(){
-  let startX=0,currentTask=null;
-  document.addEventListener('touchstart',function(e){
-    const wrap=e.target.closest('.dev-task-wrap');
-    if(!wrap){startX=0;currentTask=null;return;}
-    const task=wrap.querySelector('.dev-task');
-    if(!task){startX=0;currentTask=null;return;}
-    startX=e.touches[0].clientX;
-    currentTask=task;
-  },{passive:true});
-  document.addEventListener('touchmove',function(e){
-    if(!currentTask||!startX)return;
-    const dx=e.touches[0].clientX-startX;
-    if(dx<-20)currentTask.style.transform='translateX('+Math.max(-80,dx)+'px)';
-    else if(dx>10)currentTask.style.transform='translateX(0)';
-  },{passive:true});
-  document.addEventListener('touchend',function(){
-    if(!currentTask||!startX)return;
-    const rect=currentTask.getBoundingClientRect();
-    const dx=-(startX-(rect.left+rect.width/2));
-    currentTask.style.transform='';
-    if(dx>40)currentTask.classList.add('swiped');
-    else currentTask.classList.remove('swiped');
-    startX=0;currentTask=null;
-  },{passive:true});
-  document.addEventListener('click',function(e){
-    if(e.target.closest('.dev-task-reveal,.dt-actions,.dtc'))return;
-    document.querySelectorAll('.dev-task.swiped').forEach(t=>t.classList.remove('swiped'));
-  });
-})();
-
 // stats
 function renderStats(){
   const s=STATE.stats;
@@ -2135,20 +2101,14 @@ function renderDev(){
 function dtHTML(t,clr='#00e5ff'){
   const cc=t.done?'checked':(t.status==='doing'?'doing':'');
   const ct=t.done?'✓':(t.status==='doing'?'●':'');
-  return `<div class="dev-task-wrap">
-    <div class="dev-task" id="dt-${t.id}">
-      <div class="dtc ${cc}" onclick="toggleTask('${t.id}')">${ct}</div>
-      <div class="dt-info">
-        <div class="dt-name ${t.done?'done':''}">${t.name}</div>
-        ${t.description?`<div class="dt-desc">${t.description}</div>`:''}
-        <div class="dt-tags"><span class="sp sp-${t.status}">${t.status}</span><span class="tag tag-${t.priority}">${t.priority}</span><span style="font-size:9px;color:var(--text2)">↑ ${t.impact}</span></div>
-      </div>
-      <div class="dt-actions"><button class="ca-btn" onclick="openTaskModal('${t.id}')" title="Editar">✎</button></div>
+  return `<div class="dev-task">
+    <div class="dtc ${cc}" onclick="toggleTask('${t.id}')">${ct}</div>
+    <div class="dt-info">
+      <div class="dt-name ${t.done?'done':''}">${t.name}</div>
+      ${t.description?`<div class="dt-desc">${t.description}</div>`:''}
+      <div class="dt-tags"><span class="sp sp-${t.status}">${t.status}</span><span class="tag tag-${t.priority}">${t.priority}</span><span style="font-size:9px;color:var(--text2)">↑ ${t.impact}</span></div>
     </div>
-    <div class="dev-task-reveal">
-      <button class="ca-btn" onclick="openTaskModal('${t.id}')" title="Editar">✎</button>
-      <button class="ca-btn del" onclick="event.stopPropagation();if(confirm('¿Eliminar task \\'${t.name.replace(/'/g,"\\'")}\\'?')){api('/api/tasks/${t.id}','DELETE').then(()=>{loadTasks();loadStats();renderDev();renderStats();toast('Task eliminada','error');});}" title="Borrar">✕</button>
-    </div>
+    <div class="dt-actions"><button class="ca-btn" onclick="openTaskModal('${t.id}')" title="Editar">✎</button></div>
   </div>`;
 }
 
@@ -2370,11 +2330,11 @@ async function deleteLog(id){
 // modals
 function openModal(id){
   document.getElementById(id).classList.add('open');
-  document.getElementById('mobile-bottom-nav')?.classList.add('hidden');
+  document.getElementById('chat-fab')?.classList.add('modal-open');
 }
 function closeModal(id){
   document.getElementById(id).classList.remove('open');
-  document.getElementById('mobile-bottom-nav')?.classList.remove('hidden');
+  document.getElementById('chat-fab')?.classList.remove('modal-open');
 }
 function overlayClose(e,id){if(e.target.id===id)closeModal(id);}
 function v(id){return document.getElementById(id).value;}
