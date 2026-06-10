@@ -1471,6 +1471,10 @@ input,select,textarea{font-family:inherit;}
   .chat-panel{bottom:calc(82px + 56px);}
   /* [P6] hide progress bars on mobile — keeps only % and count */
   .prog-track{display:none;}
+  /* padding-bottom en scroll containers para que no queden detras del nav */
+  .dev-body,.strategy-body,.guide-body,.camp-cards-wrap,.cr-body{padding-bottom:56px;}
+  /* panel-actions wrap para filtros de estrategia */
+  .panel-actions{flex-wrap:wrap;gap:4px;}
 }
 
 /* ── SMALL MOBILE <=480 ── */
@@ -1496,6 +1500,8 @@ input,select,textarea{font-family:inherit;}
   /* [P9] bottom sheet modals */
   .overlay{align-items:flex-end;padding:0;}
   .modal{border-radius:12px 12px 0 0;margin:0;max-height:90vh;}
+  /* compactar filtros estrategia */
+  #log-filter .btn-sm{padding:2px 6px;font-size:9px;}
 }
 
 /* ── TOUCH (sin hover / puntero grueso) ── */
@@ -1526,7 +1532,6 @@ input,select,textarea{font-family:inherit;}
     <div class="brand-dot"></div>
     <div><div class="brand-name">OPENAETH</div><div class="brand-version">COMMAND CORE v2.1</div></div>
   </div>
-  <button class="hamburger" id="hamburger" aria-label="Menú" aria-expanded="false" onclick="toggleSidebar()">☰</button>
   <div class="topbar-nav">
     <button class="nav-tab active" style="--tab-color:var(--orange)" data-panel="dev" onclick="switchPanel('dev',this)">
       ⚙️ DEV <span class="nav-badge" id="nb-dev" style="background:var(--orange)">0</span><span id="nb-dev-tasks" style="font-size:9px;color:var(--text2);margin-left:2px"></span>
@@ -1547,6 +1552,7 @@ input,select,textarea{font-family:inherit;}
     <div class="topbar-stat"><div class="topbar-stat-val" style="color:var(--purple-light)" id="ts-logs">—</div><div class="topbar-stat-label">logs</div></div>
     <div class="topbar-clock" id="clock">—</div>
   </div>
+  <button class="hamburger" id="hamburger" aria-label="Menú" aria-expanded="false" onclick="toggleSidebar()">☰</button>
 </div>
 
 <div class="body-area">
@@ -1608,8 +1614,7 @@ input,select,textarea{font-family:inherit;}
   <!-- CAMPAÑA — Dashboard de la Desarrolladora -->
   <div class="panel" id="panel-campaign">
     <div class="panel-header">
-      <div class="panel-title" style="color:var(--purple-light)">🚀 CAMPAÑA <span class="panel-sub">— Dashboard de la Desarrolladora · datos en vivo del módulo DEV</span></div>
-      <div class="panel-actions"><button class="btn" onclick="loadDevMetrics().then(renderCampaign)">↻ Actualizar</button></div>
+      <div class="panel-title" style="color:var(--purple-light);width:100%">🚀 CAMPAÑA <span class="panel-sub">— Dashboard de la Desarrolladora · datos en vivo del módulo DEV</span><button class="btn" style="margin-left:auto;flex-shrink:0" onclick="loadDevMetrics().then(renderCampaign)">↻ Actualizar</button></div>
     </div>
     <div class="campaign-layout">
       <div class="campaign-left">
