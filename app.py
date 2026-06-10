@@ -1452,7 +1452,7 @@ input,select,textarea{font-family:inherit;}
   .guide-hero-right{min-width:0;width:100%;flex-direction:row;flex-wrap:wrap;}
   /* [P7] hamburguesa visible */
   .hamburger{display:flex;align-items:center;justify-content:center;width:38px;height:38px;
-    background:none;border:none;color:var(--text0);font-size:18px;cursor:pointer;flex-shrink:0;}
+    background:none;border:none;color:var(--text0);font-size:18px;cursor:pointer;flex-shrink:0;margin-left:auto;}
   /* [P4] topbar 1-row, nav hidden <=768 */
   .topbar-nav{display:none;}
   .topbar-stat:nth-child(2),.topbar-stat:nth-child(3){display:none;}
