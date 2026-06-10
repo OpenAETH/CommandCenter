@@ -1467,16 +1467,20 @@ input,select,textarea{font-family:inherit;}
   .chat-panel{bottom:calc(82px + 56px);}
   /* [P6] hide progress bars on mobile — keeps only % and count */
   .prog-track{display:none;}
-  /* padding-bottom en scroll containers para que no queden detras del nav */
-  .dev-body,.strategy-body,.guide-body,.camp-cards-wrap,.cr-body{padding-bottom:56px;}
+  /* gap real bajo el bottom nav: altura nav (56px) + respiro + safe-area
+     para que la ultima tarea/log no quede pegada al nav */
+  .dev-body,.strategy-body,.guide-body,.camp-cards-wrap,.cr-body{
+    padding-bottom:calc(56px + 28px + env(safe-area-inset-bottom,0px));}
   /* panel-actions wrap para filtros de estrategia */
   .panel-actions{flex-wrap:wrap;gap:4px;}
-  /* campaña: solo bottom padding, el horizontal lo da el base CSS */
   .campaign-right{border-top:1px solid var(--border);}
   /* bottom padding forzado para DEV, Estrategia y Guia */
-  .dev-body{padding:14px 18px 56px 18px!important;}
-  .strategy-body{padding:12px 18px 56px 18px!important;}
-  .guide-body{padding:12px 16px 56px 16px!important;}
+  .dev-body{padding:14px 18px calc(56px + 28px + env(safe-area-inset-bottom,0px)) 18px!important;}
+  .strategy-body{padding:12px 18px calc(56px + 28px + env(safe-area-inset-bottom,0px)) 18px!important;}
+  .guide-body{padding:12px 16px calc(56px + 28px + env(safe-area-inset-bottom,0px)) 16px!important;}
+  /* campaña: padding-right extra para que tarjetas y Productos no se peguen al lateral */
+  .camp-cards-wrap{padding:12px 18px calc(56px + 28px + env(safe-area-inset-bottom,0px)) 16px!important;}
+  .cr-body{padding:12px 18px calc(56px + 28px + env(safe-area-inset-bottom,0px)) 14px!important;}
 }
 
 /* ── SMALL MOBILE <=480 ── */
