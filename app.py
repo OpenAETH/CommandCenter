@@ -1099,7 +1099,7 @@ input,select,textarea{font-family:inherit;}
   cursor:pointer;user-select:none;transition:background .12s;}
 .dev-prod-head:hover{background:rgba(255,255,255,.02);}
 .dev-prod-icon{font-size:18px;flex-shrink:0;}
-.dev-prod-name{font-family:var(--sans);font-size:13px;font-weight:800;flex:1;}
+.dev-prod-name{font-family:var(--sans);font-size:13px;font-weight:800;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .dev-prod-status{font-size:9px;padding:2px 7px;border-radius:2px;font-weight:700;text-transform:uppercase;}
 .dev-prod-status.activo{background:var(--green-dim);color:var(--green);border:1px solid rgba(57,255,20,.25);}
 .dev-prod-status.idea{background:var(--purple-dim);color:var(--purple-light);border:1px solid rgba(168,127,255,.25);}
@@ -1380,13 +1380,41 @@ input,select,textarea{font-family:inherit;}
 .chat-bubble th{background:var(--bg3);font-weight:700}
 
 /* ===== RESPONSIVE — REGISTRO =====
-   ledger: P1=done P2=done P3=done P4=done P5=done P6=done P7=done
+   ledger: P1=done P2=done P3=done P4=done P5=done P6=done P7=done P8=done P9=done
    Cada fase voltea su tag a =done y añade su marcador abajo.
    Cascada mobile-last: desktop -> mas estrecho. Todo gateado tras @media. */
 
 /* [P7] base: hamburguesa y scrim ocultos en desktop */
 .hamburger{display:none;}
 .sidebar-scrim{display:none;}
+/* [P8] base: bottom nav oculto en desktop */
+.mobile-bottom-nav{display:none;}
+/* ══ MOBILE BOTTOM NAV — base styles ══ */
+.mobile-bottom-nav{position:fixed;bottom:0;left:0;right:0;height:56px;
+  background:var(--bg1);border-top:1px solid var(--border);z-index:700;
+  justify-content:space-around;align-items:center;
+  padding-bottom:env(safe-area-inset-bottom,0px);}
+.mb-nav-tab{display:flex;flex-direction:column;align-items:center;gap:2px;
+  background:none;border:none;color:var(--text2);padding:6px 8px;
+  position:relative;min-width:0;cursor:pointer;font-family:inherit;
+  transition:color .15s;-webkit-tap-highlight-color:transparent;}
+.mb-nav-tab:active{opacity:.7;}
+.mb-nav-tab.active{color:var(--tab-color,var(--cyan));}
+.mb-nav-tab[data-panel="dev"]{--tab-color:var(--orange);}
+.mb-nav-tab[data-panel="campaign"]{--tab-color:var(--purple-light);}
+.mb-nav-tab[data-panel="strategy"]{--tab-color:var(--green);}
+.mb-nav-tab[data-panel="guide"]{--tab-color:var(--gold);}
+.mb-chat-btn{--tab-color:var(--purple);}
+.mb-icon{font-size:18px;line-height:1;}
+.mb-label{font-size:9px;letter-spacing:.05em;text-transform:uppercase;}
+.mb-badge{position:absolute;top:2px;right:2px;background:var(--tab-color,var(--orange));
+  color:var(--bg0);font-size:8px;font-weight:700;padding:1px 4px;
+  border-radius:2px;min-width:15px;text-align:center;line-height:1.3;}
+/* ══ SWIPE-TO-REVEAL — base styles ══ */
+.dev-task-wrap{position:relative;overflow:hidden;}
+.dev-task-reveal{position:absolute;right:0;top:0;bottom:0;display:none;
+  align-items:flex-start;gap:4px;padding:7px 10px;background:var(--bg2);}
+.dev-task{position:relative;z-index:1;background:var(--bg0);}
 
 /* ── TABLET <=1024 ── */
 @media (max-width:1024px){
@@ -1435,6 +1463,14 @@ input,select,textarea{font-family:inherit;}
   .dev-task{padding-left:16px;}
   .guide-body,.strategy-body{padding:12px;}
   .camp-metrics-bar{gap:6px;}
+  /* [P8] bottom nav bar */
+  .mobile-bottom-nav{display:flex;}
+  .main{padding-bottom:56px;padding-bottom:calc(56px + env(safe-area-inset-bottom,0px));}
+  /* adjust FAB so it doesn't hide behind bottom nav */
+  .chat-fab{bottom:calc(22px + 56px);}
+  .chat-panel{bottom:calc(82px + 56px);}
+  /* [P6] hide progress bars on mobile — keeps only % and count */
+  .prog-track{display:none;}
 }
 
 /* ── SMALL MOBILE <=480 ── */
@@ -1457,6 +1493,9 @@ input,select,textarea{font-family:inherit;}
   .mc-val{font-size:18px;}
   .status-val{font-size:22px;}
   .guide-hero-title{font-size:16px;}
+  /* [P9] bottom sheet modals */
+  .overlay{align-items:flex-end;padding:0;}
+  .modal{border-radius:12px 12px 0 0;margin:0;max-height:90vh;}
 }
 
 /* ── TOUCH (sin hover / puntero grueso) ── */
@@ -1466,6 +1505,14 @@ input,select,textarea{font-family:inherit;}
   .log-del{display:flex!important;}
   .nav-tab,.sidebar-link,.btn,.modal-close,.chat-send{min-height:38px;}
   .dtc{width:18px;height:18px;}
+  /* [P10] touch targets mas grandes para acciones */
+  .ca-btn{width:32px;height:32px;font-size:12px;}
+  /* [P10] swipe mechanic */
+  .dev-task-wrap{overflow:hidden;position:relative;touch-action:pan-y;}
+  .dev-task{transition:transform .25s ease;position:relative;z-index:1;background:var(--bg0);}
+  .dev-task.swiped{transform:translateX(-80px);}
+  .dev-task-reveal{position:absolute;right:0;top:0;bottom:0;display:flex;align-items:flex-start;
+    gap:4px;padding:7px 10px;background:var(--bg2);border-bottom:1px solid var(--border);}
 }
 /* ===== /RESPONSIVE ===== */
 </style>
@@ -1548,6 +1595,7 @@ input,select,textarea{font-family:inherit;}
       <div class="panel-title" style="color:var(--orange)">⚙️ DEV <span class="panel-sub">— Portafolio de productos</span></div>
       <div class="panel-actions">
         <button class="btn" onclick="expandAllProducts()">Expandir todo</button>
+        <button class="btn" onclick="collapseAllProducts()">Colapsar todo</button>
         <button class="btn" onclick="openProductModal()">+ Producto</button>
         <button class="btn btn-primary" onclick="openTaskModal()">+ Task</button>
       </div>
@@ -1745,6 +1793,32 @@ input,select,textarea{font-family:inherit;}
 </div><!-- /body-area -->
 </div><!-- /shell -->
 
+<!-- MOBILE BOTTOM NAV (<=768px) -->
+<nav class="mobile-bottom-nav" id="mobile-bottom-nav">
+  <button class="mb-nav-tab active" data-panel="dev" onclick="switchPanel('dev',this)">
+    <span class="mb-icon">⚙️</span>
+    <span class="mb-label">DEV</span>
+    <span class="mb-badge" id="mb-badge-dev">0</span>
+  </button>
+  <button class="mb-nav-tab" data-panel="campaign" onclick="switchPanel('campaign',this)">
+    <span class="mb-icon">🚀</span>
+    <span class="mb-label">CAMPAÑA</span>
+  </button>
+  <button class="mb-nav-tab" data-panel="strategy" onclick="switchPanel('strategy',this)">
+    <span class="mb-icon">🧠</span>
+    <span class="mb-label">ESTRATEGIA</span>
+    <span class="mb-badge" id="mb-badge-str">0</span>
+  </button>
+  <button class="mb-nav-tab" data-panel="guide" onclick="switchPanel('guide',this)">
+    <span class="mb-icon">📖</span>
+    <span class="mb-label">GUÍA</span>
+  </button>
+  <button class="mb-nav-tab mb-chat-btn" onclick="toggleChat()">
+    <span class="mb-icon">🤖</span>
+    <span class="mb-label">IA</span>
+  </button>
+</nav>
+
 <div class="toast-wrap" id="toast-wrap"></div>
 
 <!-- MODAL TASK -->
@@ -1896,6 +1970,8 @@ function switchPanel(name,btnEl){
   document.getElementById('panel-'+name).classList.add('active');
   document.querySelectorAll('.nav-tab').forEach(b=>b.classList.remove('active'));
   (btnEl||document.querySelector('.nav-tab[data-panel="'+name+'"]'))?.classList.add('active');
+  document.querySelectorAll('.mb-nav-tab').forEach(b=>b.classList.remove('active'));
+  (document.querySelector('.mb-nav-tab[data-panel="'+name+'"]'))?.classList.add('active');
   document.querySelectorAll('.sidebar-link').forEach(b=>b.classList.remove('active'));
   document.getElementById('sl-'+name)?.classList.add('active');
   if(name==='campaign') loadDevMetrics().then(()=>renderCampaign()).catch(()=>renderCharts());
@@ -1920,6 +1996,38 @@ function closeSidebar(){
   document.getElementById('hamburger')?.setAttribute('aria-expanded','false');
 }
 
+/* [P10] swipe-to-reveal: touch events on tasks */
+(function(){
+  let startX=0,currentTask=null;
+  document.addEventListener('touchstart',function(e){
+    const wrap=e.target.closest('.dev-task-wrap');
+    if(!wrap){startX=0;currentTask=null;return;}
+    const task=wrap.querySelector('.dev-task');
+    if(!task){startX=0;currentTask=null;return;}
+    startX=e.touches[0].clientX;
+    currentTask=task;
+  },{passive:true});
+  document.addEventListener('touchmove',function(e){
+    if(!currentTask||!startX)return;
+    const dx=e.touches[0].clientX-startX;
+    if(dx<-20)currentTask.style.transform='translateX('+Math.max(-80,dx)+'px)';
+    else if(dx>10)currentTask.style.transform='translateX(0)';
+  },{passive:true});
+  document.addEventListener('touchend',function(){
+    if(!currentTask||!startX)return;
+    const rect=currentTask.getBoundingClientRect();
+    const dx=-(startX-(rect.left+rect.width/2));
+    currentTask.style.transform='';
+    if(dx>40)currentTask.classList.add('swiped');
+    else currentTask.classList.remove('swiped');
+    startX=0;currentTask=null;
+  },{passive:true});
+  document.addEventListener('click',function(e){
+    if(e.target.closest('.dev-task-reveal,.dt-actions,.dtc'))return;
+    document.querySelectorAll('.dev-task.swiped').forEach(t=>t.classList.remove('swiped'));
+  });
+})();
+
 // stats
 function renderStats(){
   const s=STATE.stats;
@@ -1929,9 +2037,11 @@ function renderStats(){
   setText('gs-t',s.tasks_todo);setText('gs-prod',(s.products_active||s.products_total||0)+' activos');setText('gs-p',pct+'%');setText('gs-l',s.logs_total);
   setText('g-st',(s.tasks_doing||0)+(s.tasks_todo||0));setText('g-prod',s.products_active||s.products_total||0);setText('g-sp',pct+'%');setText('g-sl',s.logs_total);
   setText('nb-dev',s.products_total||0);setText('slb-dev',s.products_total||0);
+  setText('mb-badge-dev',s.products_total||0);
   const devTaskEl=document.getElementById('nb-dev-tasks');
   if(devTaskEl) devTaskEl.textContent=(s.tasks_doing||0)+' doing';
   setText('nb-str',s.logs_total||0);setText('slb-str',s.logs_total||0);
+  setText('mb-badge-str',s.logs_total||0);
 }
 
 // ══ DEV ══
@@ -1943,6 +2053,10 @@ function expandAllProducts(){
     const mods=[...new Set(STATE.tasks.filter(t=>t.product_id===p.id).map(t=>t.module))];
     mods.forEach(m=>{prodExp[p.id].modules[m]=true;});
   });
+  renderDev();
+}
+function collapseAllProducts(){
+  STATE.products.forEach(p=>{prodExp[p.id]={open:false,modules:{}};});
   renderDev();
 }
 
@@ -2013,14 +2127,20 @@ function renderDev(){
 function dtHTML(t,clr='#00e5ff'){
   const cc=t.done?'checked':(t.status==='doing'?'doing':'');
   const ct=t.done?'✓':(t.status==='doing'?'●':'');
-  return `<div class="dev-task">
-    <div class="dtc ${cc}" onclick="toggleTask('${t.id}')">${ct}</div>
-    <div class="dt-info">
-      <div class="dt-name ${t.done?'done':''}">${t.name}</div>
-      ${t.description?`<div class="dt-desc">${t.description}</div>`:''}
-      <div class="dt-tags"><span class="sp sp-${t.status}">${t.status}</span><span class="tag tag-${t.priority}">${t.priority}</span><span style="font-size:9px;color:var(--text2)">↑ ${t.impact}</span></div>
+  return `<div class="dev-task-wrap">
+    <div class="dev-task" id="dt-${t.id}">
+      <div class="dtc ${cc}" onclick="toggleTask('${t.id}')">${ct}</div>
+      <div class="dt-info">
+        <div class="dt-name ${t.done?'done':''}">${t.name}</div>
+        ${t.description?`<div class="dt-desc">${t.description}</div>`:''}
+        <div class="dt-tags"><span class="sp sp-${t.status}">${t.status}</span><span class="tag tag-${t.priority}">${t.priority}</span><span style="font-size:9px;color:var(--text2)">↑ ${t.impact}</span></div>
+      </div>
+      <div class="dt-actions"><button class="ca-btn" onclick="openTaskModal('${t.id}')" title="Editar">✎</button></div>
     </div>
-    <div class="dt-actions"><button class="ca-btn" onclick="openTaskModal('${t.id}')" title="Editar">✎</button></div>
+    <div class="dev-task-reveal">
+      <button class="ca-btn" onclick="openTaskModal('${t.id}')" title="Editar">✎</button>
+      <button class="ca-btn del" onclick="event.stopPropagation();if(confirm('¿Eliminar task \\'${t.name.replace(/'/g,"\\'")}\\'?')){api('/api/tasks/${t.id}','DELETE').then(()=>{loadTasks();loadStats();renderDev();renderStats();toast('Task eliminada','error');});}" title="Borrar">✕</button>
+    </div>
   </div>`;
 }
 
