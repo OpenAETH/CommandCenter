@@ -1158,7 +1158,7 @@ input,select,textarea{font-family:inherit;}
 .chart-box-title{font-size:9px;color:var(--text2);letter-spacing:.1em;text-transform:uppercase;margin-bottom:8px;}
 .chart-box canvas{max-height:120px;}
 .camp-cards-wrap{flex:1;overflow-y:auto;padding:12px 16px;display:flex;flex-direction:column;gap:8px;}
-.status-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;}
+.status-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;}
 .status-card{background:var(--bg1);border:1px solid var(--border);border-top:2px solid var(--border2);
   border-radius:var(--r);padding:16px 14px;text-align:center;}
 .status-card.todo{border-top-color:var(--text2);}
@@ -1479,8 +1479,8 @@ input,select,textarea{font-family:inherit;}
   .strategy-body{padding:12px 18px calc(56px + 28px + env(safe-area-inset-bottom,0px)) 18px!important;}
   .guide-body{padding:12px 16px calc(56px + 28px + env(safe-area-inset-bottom,0px)) 16px!important;}
   /* campaña: padding-right extra para que tarjetas y Productos no se peguen al lateral */
-  .camp-cards-wrap{padding:12px 18px calc(56px + 28px + env(safe-area-inset-bottom,0px)) 16px!important;}
-  .cr-body{padding:12px 18px calc(56px + 28px + env(safe-area-inset-bottom,0px)) 14px!important;}
+  .camp-cards-wrap{padding:12px 16px calc(56px + 28px + env(safe-area-inset-bottom,0px)) 16px!important;}
+  .cr-body{padding:12px 16px calc(56px + 28px + env(safe-area-inset-bottom,0px)) 16px!important;}
 }
 
 /* ── SMALL MOBILE <=480 ── */
@@ -1494,7 +1494,7 @@ input,select,textarea{font-family:inherit;}
   .modal-body{padding:14px;}
   .f-row{grid-template-columns:1fr;}
   /* [P3] grids -> 1col */
-  .status-grid{grid-template-columns:repeat(3,1fr);gap:4px;}
+  .status-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;}
   .status-card{padding:10px 6px;}
   .status-val{font-size:18px;}
   .status-lbl{font-size:8px;}
