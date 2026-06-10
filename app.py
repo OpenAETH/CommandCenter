@@ -1471,16 +1471,12 @@ input,select,textarea{font-family:inherit;}
   .dev-body,.strategy-body,.guide-body,.camp-cards-wrap,.cr-body{padding-bottom:56px;}
   /* panel-actions wrap para filtros de estrategia */
   .panel-actions{flex-wrap:wrap;gap:4px;}
-  /* campaña: padding derecho y bottom contra el nav */
-  .campaign-layout{padding:0 12px 0 12px;}
-  .campaign-left{border-right:none;}
-  .campaign-right{border-top:1px solid var(--border);padding:0 0 56px 0;}
-  .camp-metrics-bar{padding:12px 12px;}
-  .camp-charts{padding:12px 0;}
-  .camp-cards-wrap{padding:12px 0 56px 0;}
-  /* padding-bottom explicito para DEV y Estrategia */
-  .dev-body{padding-bottom:56px;}
-  .strategy-body{padding-bottom:56px;}
+  /* campaña: solo bottom padding, el horizontal lo da el base CSS */
+  .campaign-right{border-top:1px solid var(--border);}
+  /* bottom padding forzado para DEV, Estrategia y Guia */
+  .dev-body{padding:14px 18px 56px 18px!important;}
+  .strategy-body{padding:12px 18px 56px 18px!important;}
+  .guide-body{padding:12px 16px 56px 16px!important;}
 }
 
 /* ── SMALL MOBILE <=480 ── */
