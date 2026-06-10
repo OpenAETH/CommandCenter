@@ -1417,14 +1417,18 @@ input,select,textarea{font-family:inherit;}
   /* [P1] sidebar off-canvas <=768 (preludio: encoge a 1024) */
   .sidebar{width:170px;}
   .topbar-brand{width:170px;}
-  /* [P3] grids -> 1col (campaign 2col->1, guide 3col->2) */
-  .campaign-layout{grid-template-columns:1fr;}
-  .guide-grid{grid-template-columns:repeat(2,1fr);}
+  /* [P3] grids -> 1col (campaign 2col->1, guide 3col->2)
+     minmax(0,1fr): evita que canvas/contenido fuercen la columna mas ancha
+     que el viewport (causa de desborde a la derecha recortado por overflow-x) */
+  .campaign-layout{grid-template-columns:minmax(0,1fr);}
+  .guide-grid{grid-template-columns:repeat(2,minmax(0,1fr));}
   /* mitigacion overflow anidado: el panel scrollea como un todo */
   #panel-campaign.active{overflow-y:auto;}
-  .campaign-layout{overflow:visible;}
-  .campaign-left,.campaign-right{overflow:visible;border-right:none;}
-  .camp-cards-wrap,.cr-body{overflow:visible;flex:none;}
+  .campaign-layout{overflow:visible;min-width:0;}
+  .campaign-left,.campaign-right{overflow:visible;border-right:none;min-width:0;}
+  .camp-cards-wrap,.cr-body{overflow:visible;flex:none;min-width:0;}
+  /* cadena flex sin min-width:0 no encoge bajo su contenido -> desborde */
+  .main,.panel{min-width:0;}
   /* [P4] topbar 1-row, nav hidden <=768 (preludio: compacta a 1024) */
   .topbar-clock{display:none;}
   .nav-tab{padding:0 9px;font-size:10px;}
