@@ -1266,7 +1266,7 @@ input,select,textarea{font-family:inherit;}
 .gr-icon{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0;}
 
 /* ══ MODAL ══ */
-.overlay{position:fixed;inset:0;z-index:500;background:rgba(6,9,13,.85);
+.overlay{position:fixed;inset:0;z-index:750;background:rgba(6,9,13,.85);
   display:none;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(4px);}
 .overlay.open{display:flex;animation:fadeIn .15s ease;}
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
@@ -1475,9 +1475,12 @@ input,select,textarea{font-family:inherit;}
   .campaign-layout{padding:0 12px 0 12px;}
   .campaign-left{border-right:none;}
   .campaign-right{border-top:1px solid var(--border);padding:0 0 56px 0;}
-  .camp-metrics-bar{padding:12px 0;}
+  .camp-metrics-bar{padding:12px 12px;}
   .camp-charts{padding:12px 0;}
   .camp-cards-wrap{padding:12px 0 56px 0;}
+  /* padding-bottom explicito para DEV y Estrategia */
+  .dev-body{padding-bottom:56px;}
+  .strategy-body{padding-bottom:56px;}
 }
 
 /* ── SMALL MOBILE <=480 ── */
