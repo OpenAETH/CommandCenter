@@ -1305,6 +1305,8 @@ input,select,textarea{font-family:inherit;}
 .modal-close:hover{color:var(--text0);}
 .modal-body{padding:18px;display:flex;flex-direction:column;gap:13px;}
 .modal-foot{padding:12px 18px;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;}
+.modal-confirm{width:400px;}
+.confirm-msg{font-size:12px;color:var(--text1);line-height:1.6;}
 .f-group{display:flex;flex-direction:column;gap:4px;}
 .f-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
 .f-label{font-size:9px;color:var(--text2);letter-spacing:.1em;text-transform:uppercase;}
@@ -1951,6 +1953,18 @@ input,select,textarea{font-family:inherit;}
   </div>
 </div>
 
+<!-- MODAL CONFIRM -->
+<div class="overlay" id="modal-confirm" onclick="overlayClose(event,'modal-confirm')">
+  <div class="modal modal-confirm">
+    <div class="modal-head"><div class="modal-title" id="confirm-title">Confirmar</div><button class="modal-close" onclick="resolveConfirm(false)">✕</button></div>
+    <div class="modal-body"><div class="confirm-msg" id="confirm-msg"></div></div>
+    <div class="modal-foot">
+      <span></span>
+      <div style="display:flex;gap:7px"><button class="btn" onclick="resolveConfirm(false)">Cancelar</button><button class="btn btn-danger" id="confirm-ok-btn" onclick="resolveConfirm(true)">Eliminar</button></div>
+    </div>
+  </div>
+</div>
+
 <script>
 const API='';
 let STATE={tasks:[],devMetrics:{},logs:[],stats:{},products:[]};
@@ -2203,7 +2217,8 @@ async function saveTask(){
   }catch(e){toast(e.message,'error');}
 }
 async function deleteTask(){
-  const id=document.getElementById('task-id').value;if(!id||!confirm('¿Eliminar?'))return;
+  const id=document.getElementById('task-id').value;if(!id)return;
+  if(!await confirmDialog({title:'Eliminar task',message:'¿Eliminar esta task? Esta acción no se puede deshacer.',okText:'Eliminar'}))return;
   try{await api('/api/tasks/'+id,'DELETE');closeModal('modal-task');await loadTasks();await loadStats();renderDev();renderStats();toast('Task eliminada','error');}
   catch(e){toast(e.message,'error');}
 }
@@ -2240,7 +2255,8 @@ async function saveProduct(){
   }catch(e){toast(e.message,'error');}
 }
 async function deleteProduct(){
-  const id=document.getElementById('product-id').value;if(!id||!confirm('¿Eliminar producto y todas sus tasks?'))return;
+  const id=document.getElementById('product-id').value;if(!id)return;
+  if(!await confirmDialog({title:'Eliminar producto',message:'¿Eliminar el producto y todas sus tasks? Esta acción no se puede deshacer.',okText:'Eliminar'}))return;
   try{await api('/api/products/'+id,'DELETE');closeModal('modal-product');await loadProducts();await loadTasks();await loadStats();renderDev();renderStats();toast('Producto eliminado','error');}
   catch(e){toast(e.message,'error');}
 }
@@ -2379,7 +2395,7 @@ async function saveLog(){
   }catch(e){toast(e.message,'error');}
 }
 async function deleteLog(id){
-  if(!confirm('¿Eliminar?'))return;
+  if(!await confirmDialog({title:'Eliminar log',message:'¿Eliminar este log estratégico? Esta acción no se puede deshacer.',okText:'Eliminar'}))return;
   try{await api(`/api/logs/${id}`,'DELETE');await loadLogs();await loadStats();renderStrategy();renderStats();toast('Log eliminado','error');}
   catch(e){toast(e.message,'error');}
 }
@@ -2393,7 +2409,20 @@ function closeModal(id){
   document.getElementById(id).classList.remove('open');
   document.getElementById('chat-fab')?.classList.remove('modal-open');
 }
-function overlayClose(e,id){if(e.target.id===id)closeModal(id);}
+function overlayClose(e,id){if(e.target.id!==id)return;if(id==='modal-confirm'&&_confirmResolve){resolveConfirm(false);return;}closeModal(id);}
+// modal de confirmación reutilizable (reemplaza el confirm() nativo)
+let _confirmResolve=null;
+function confirmDialog({title='Confirmar',message='',okText='Eliminar'}={}){
+  document.getElementById('confirm-title').textContent=title;
+  document.getElementById('confirm-msg').textContent=message;
+  document.getElementById('confirm-ok-btn').textContent=okText;
+  openModal('modal-confirm');
+  return new Promise(res=>{_confirmResolve=res;});
+}
+function resolveConfirm(val){
+  closeModal('modal-confirm');
+  if(_confirmResolve){_confirmResolve(val);_confirmResolve=null;}
+}
 function v(id){return document.getElementById(id).value;}
 function shake(id){
   const el=document.getElementById(id);if(!el)return;
@@ -2409,7 +2438,7 @@ function toast(msg,type='info'){
   wrap.appendChild(el);setTimeout(()=>el.remove(),3100);
 }
 document.addEventListener('keydown',e=>{
-  if(e.key==='Escape'){document.querySelectorAll('.overlay.open').forEach(o=>o.classList.remove('open'));closeSidebar();return;}
+  if(e.key==='Escape'){if(_confirmResolve)resolveConfirm(false);document.querySelectorAll('.overlay.open').forEach(o=>o.classList.remove('open'));closeSidebar();return;}
   if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA'||e.target.tagName==='SELECT')return;
   const map={'1':'dev','2':'campaign','3':'strategy','4':'guide'};
   if(map[e.key])switchPanel(map[e.key]);
@@ -2498,8 +2527,8 @@ async function sendChat(){
   }
 }
 
-function clearChat(){
-  if(!confirm('¿Limpiar todo el historial de AETHY?'))return;
+async function clearChat(){
+  if(!await confirmDialog({title:'Limpiar historial',message:'¿Limpiar todo el historial de AETHY? Esta acción no se puede deshacer.',okText:'Limpiar'}))return;
   chatHistory=[];
   document.getElementById('chat-messages').innerHTML='';
   localStorage.removeItem('aethyChat');
