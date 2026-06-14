@@ -337,6 +337,26 @@ def create_log():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/logs/<string:lid>', methods=['PUT'])
+def update_log(lid):
+    d = request.json
+    try:
+        update = {
+            'type':  d.get('type', 'Insight'),
+            'title': d.get('title', ''),
+            'text':  d.get('text', ''),
+            'links': d.get('links', []),
+            'date':  d.get('date', datetime.now().strftime('%Y-%m-%d')),
+            'updated_at': datetime.utcnow(),
+        }
+        result = db.strategy_logs.find_one_and_update(
+            {'_id': oid(lid)}, {'$set': update}, return_document=True)
+        if not result:
+            return jsonify({'error': 'Log not found'}), 404
+        return jsonify(doc(result))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/logs/<string:lid>', methods=['DELETE'])
 def delete_log(lid):
     try:
@@ -595,14 +615,15 @@ GROQ_TOOLS = [
         "name": "create_log",
         "description": (
             "Registra una entrada en Estrategia: una decisión, insight, riesgo u oportunidad "
-            "que surja de la conversación. Útil para capturar aprendizajes."
+            "que surja de la conversación. Útil para capturar aprendizajes. "
+            "Guardá el contenido COMPLETO y literal: no resumas ni trunques."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "type":  {"type": "string", "enum": ["Decision","Insight","Riesgo","Oportunidad"]},
                 "title": {"type": "string", "description": "Título breve."},
-                "text":  {"type": "string", "description": "Contenido del log con contexto suficiente."},
+                "text":  {"type": "string", "description": "Contenido COMPLETO y literal del log. No resumas ni trunques; no agregues marcadores tipo '[...]' ni 'ver detalles completos'. Incluí el texto íntegro con todo el contexto."},
                 "links": {"type": "array", "items": {"type": "string"},
                           "description": "Conexiones opcionales, ej: 'DEV→Backend'."},
             },
@@ -883,7 +904,9 @@ def chat():
             "3. Para preguntas de avance/estado/reportes usá get_dev_metrics, no adivines números.\n"
             "4. Las acciones destructivas (delete_*) sólo si el usuario lo pide explícitamente; "
             "si hay ambigüedad, preguntá antes.\n"
-            "5. Confirmá siempre con un resumen breve de lo que hiciste."
+            "5. Confirmá siempre con un resumen breve de lo que hiciste.\n"
+            "6. Al usar create_log, guardá el texto COMPLETO y literal: nunca lo resumas, "
+            "trunques ni agregues marcadores como '[...]' o 'ver detalles completos'."
         )
     }
 
@@ -1193,16 +1216,16 @@ input,select,textarea{font-family:inherit;}
   border-left:3px solid var(--lc,var(--border2));border-radius:0 var(--r) var(--r) 0;
   padding:11px 13px;transition:background .12s;position:relative;}
 .log-entry:hover{background:var(--bg2);}
-.log-header{display:flex;align-items:center;gap:8px;margin-bottom:5px;flex-wrap:wrap;}
+.log-header{display:flex;align-items:center;gap:8px;margin-bottom:5px;flex-wrap:wrap;padding-right:56px;}
 .log-badge{padding:2px 8px;border-radius:2px;font-size:9px;font-weight:700;letter-spacing:.1em;
   text-transform:uppercase;color:var(--lc);border:1px solid var(--lc);background:rgba(0,0,0,.3);}
 .log-title{font-family:var(--sans);font-size:12px;font-weight:700;}
 .log-date{font-size:10px;color:var(--text2);margin-left:auto;}
-.log-text{font-size:11px;color:var(--text1);line-height:1.6;margin-bottom:6px;}
+.log-text{font-size:11px;color:var(--text1);line-height:1.6;margin-bottom:6px;white-space:pre-wrap;}
 .log-links{display:flex;gap:4px;flex-wrap:wrap;}
 .log-link-tag{font-size:9px;padding:2px 7px;border:1px solid var(--border2);border-radius:2px;color:var(--text2);background:var(--bg3);}
-.log-del{position:absolute;top:9px;right:9px;display:none;}
-.log-entry:hover .log-del{display:flex;}
+.log-actions{position:absolute;top:9px;right:9px;display:none;gap:4px;}
+.log-entry:hover .log-actions{display:flex;}
 
 /* ══ GUÍA — layout optimizado ══ */
 .guide-body{flex:1;overflow-y:auto;padding:16px 20px;}
@@ -1520,12 +1543,14 @@ input,select,textarea{font-family:inherit;}
 @media (hover:none),(pointer:coarse){
   /* [P5] touch actions visible: acciones hover-only siempre mostradas */
   .dt-actions{display:flex!important;}
-  .log-del{display:flex!important;}
+  .log-actions{display:flex!important;}
   .nav-tab,.sidebar-link,.btn,.modal-close,.chat-send{min-height:38px;}
   .dtc{width:18px;height:18px;}
   /* [P10] touch targets mas grandes para acciones */
   .ca-btn{width:32px;height:32px;font-size:12px;}
-
+  /* logs colapsados en touch: tap sobre el cuerpo expande */
+  .log-text{display:-webkit-box;-webkit-line-clamp:5;-webkit-box-orient:vertical;overflow:hidden;cursor:pointer;}
+  .log-text.expanded{display:block;-webkit-line-clamp:none;overflow:visible;}
 }
 /* ===== /RESPONSIVE ===== */
 .chat-fab.modal-open{bottom:auto;top:16px;right:16px;}
@@ -1905,8 +1930,9 @@ input,select,textarea{font-family:inherit;}
 <!-- MODAL LOG -->
 <div class="overlay" id="modal-log" onclick="overlayClose(event,'modal-log')">
   <div class="modal">
-    <div class="modal-head"><div class="modal-title">Nuevo Log Estratégico</div><button class="modal-close" onclick="closeModal('modal-log')">✕</button></div>
+    <div class="modal-head"><div class="modal-title" id="log-modal-title">Nuevo Log Estratégico</div><button class="modal-close" onclick="closeModal('modal-log')">✕</button></div>
     <div class="modal-body">
+      <input type="hidden" id="l-id"/>
       <div class="f-row">
         <div class="f-group"><label class="f-label">Tipo</label><select class="f-select" id="l-type"><option value="Decision">💡 Decisión</option><option value="Insight">🔍 Insight</option><option value="Riesgo">⚠️ Riesgo</option><option value="Oportunidad">🚀 Oportunidad</option></select></div>
         <div class="f-group"><label class="f-label">Fecha</label><input class="f-input" id="l-date" type="date"/></div>
@@ -1920,7 +1946,7 @@ input,select,textarea{font-family:inherit;}
     </div>
     <div class="modal-foot">
       <span></span>
-      <div style="display:flex;gap:7px"><button class="btn" onclick="closeModal('modal-log')">Cancelar</button><button class="btn btn-primary" onclick="saveLog()">Registrar</button></div>
+      <div style="display:flex;gap:7px"><button class="btn" onclick="closeModal('modal-log')">Cancelar</button><button class="btn btn-primary" id="log-save-btn" onclick="saveLog()">Registrar</button></div>
     </div>
   </div>
 </div>
@@ -2310,23 +2336,47 @@ function renderStrategy(){
     const clr=LOG_C[l.type]||'#4e6880';
     const links=Array.isArray(l.links)?l.links:[];
     return `<div class="log-entry" style="--lc:${clr}">
-      <button class="btn btn-sm btn-danger btn-icon log-del" onclick="deleteLog('${l.id}')">✕</button>
+      <div class="log-actions">
+        <button class="btn btn-sm btn-icon log-edit" onclick="event.stopPropagation();editLog('${l.id}')" title="Editar">✎</button>
+        <button class="btn btn-sm btn-danger btn-icon log-del" onclick="event.stopPropagation();deleteLog('${l.id}')" title="Eliminar">✕</button>
+      </div>
       <div class="log-header"><span class="log-badge">${l.type}</span>${l.title?`<span class="log-title">${l.title}</span>`:''}<span class="log-date">${l.date||''}</span></div>
-      <div class="log-text">${l.text}</div>
+      <div class="log-text" onclick="toggleLogText(this)">${l.text}</div>
       ${links.length?`<div class="log-links">${links.map(lk=>`<span class="log-link-tag">🔗 ${lk}</span>`).join('')}</div>`:''}</div>`;
   }).join('');
 }
-function openLogModal(){
+function toggleLogText(el){el.classList.toggle('expanded');}
+function openLogModal(id=null){
   ['l-title','l-text','l-links'].forEach(i=>document.getElementById(i).value='');
+  document.getElementById('l-id').value='';
   document.getElementById('l-type').value='Decision';
   document.getElementById('l-date').value=new Date().toISOString().slice(0,10);
+  document.getElementById('log-modal-title').textContent='Nuevo Log Estratégico';
+  document.getElementById('log-save-btn').textContent='Registrar';
+  if(id){
+    const l=STATE.logs.find(x=>x.id===id);if(!l)return;
+    document.getElementById('l-id').value=id;
+    document.getElementById('l-type').value=l.type||'Decision';
+    document.getElementById('l-date').value=l.date||new Date().toISOString().slice(0,10);
+    document.getElementById('l-title').value=l.title||'';
+    document.getElementById('l-text').value=l.text||'';
+    document.getElementById('l-links').value=(Array.isArray(l.links)?l.links:[]).join(', ');
+    document.getElementById('log-modal-title').textContent='Editar Log';
+    document.getElementById('log-save-btn').textContent='Guardar';
+  }
   openModal('modal-log');
 }
+function editLog(id){openLogModal(id);}
 async function saveLog(){
   const text=document.getElementById('l-text').value.trim();if(!text){shake('l-text');return;}
   const links=v('l-links').split(',').map(s=>s.trim()).filter(Boolean);
-  try{await api('/api/logs','POST',{type:v('l-type'),title:v('l-title'),text,links,date:v('l-date')});closeModal('modal-log');await loadLogs();await loadStats();renderStrategy();renderStats();toast('Log registrado','success');}
-  catch(e){toast(e.message,'error');}
+  const id=v('l-id');
+  const data={type:v('l-type'),title:v('l-title'),text,links,date:v('l-date')};
+  try{
+    if(id){await api(`/api/logs/${id}`,'PUT',data);toast('Log actualizado','success');}
+    else{await api('/api/logs','POST',data);toast('Log registrado','success');}
+    closeModal('modal-log');await loadLogs();await loadStats();renderStrategy();renderStats();
+  }catch(e){toast(e.message,'error');}
 }
 async function deleteLog(id){
   if(!confirm('¿Eliminar?'))return;
