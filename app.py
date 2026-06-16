@@ -1595,7 +1595,7 @@ input,select,textarea{font-family:inherit;}
 <!-- SIDEBAR -->
 <div class="sidebar">
   <div class="sidebar-section">
-    <div class="sidebar-label">Módulos</div>
+    <div class="sidebar-label">Secciones</div>
     <button class="sidebar-link active" style="--lc:var(--orange)" id="sl-dev" onclick="switchPanel('dev')">
       ⚙️ DEV <span class="sidebar-link-badge" style="background:var(--orange)" id="slb-dev">0</span>
     </button>
@@ -1868,8 +1868,8 @@ input,select,textarea{font-family:inherit;}
     <div class="modal-body">
       <input type="hidden" id="task-id"/>
       <div class="f-row">
-        <div class="f-group"><label class="f-label">Producto *</label><select class="f-select" id="t-product"></select></div>
-        <div class="f-group"><label class="f-label">Módulo *</label><input class="f-input" id="t-module" placeholder="Backend, UI, Auth..."/></div>
+        <div class="f-group"><label class="f-label">Producto *</label><select class="f-select" id="t-product" onchange="fillModuleDatalist(this.value)"></select></div>
+        <div class="f-group"><label class="f-label">Módulo *</label><input class="f-input" id="t-module" list="t-module-list" autocomplete="off" placeholder="Elegí o escribí uno nuevo..."/><datalist id="t-module-list"></datalist></div>
       </div>
       <div class="f-group"><label class="f-label">Nombre *</label><input class="f-input" id="t-name" placeholder="Descripción concisa..."/></div>
       <div class="f-group"><label class="f-label">Descripción</label><textarea class="f-textarea" id="t-desc" style="min-height:55px" placeholder="Detalles, criterios de aceptación..."></textarea></div>
@@ -2021,10 +2021,11 @@ function render(){renderDev();renderCampaign();renderStrategy();renderStats();}
 function switchPanel(name,btnEl){
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
   document.getElementById('panel-'+name).classList.add('active');
+  // Sync active state across all nav surfaces by panel name (no matter which control fired it)
   document.querySelectorAll('.nav-tab').forEach(b=>b.classList.remove('active'));
-  (btnEl||document.querySelector('.nav-tab[data-panel="'+name+'"]'))?.classList.add('active');
+  document.querySelector('.nav-tab[data-panel="'+name+'"]')?.classList.add('active');
   document.querySelectorAll('.mb-nav-tab').forEach(b=>b.classList.remove('active'));
-  (document.querySelector('.mb-nav-tab[data-panel="'+name+'"]'))?.classList.add('active');
+  document.querySelector('.mb-nav-tab[data-panel="'+name+'"]')?.classList.add('active');
   document.querySelectorAll('.sidebar-link').forEach(b=>b.classList.remove('active'));
   document.getElementById('sl-'+name)?.classList.add('active');
   if(name==='campaign') loadDevMetrics().then(()=>renderCampaign()).catch(()=>renderCharts());
@@ -2032,21 +2033,28 @@ function switchPanel(name,btnEl){
 }
 
 /* [P7] drawer JS: hamburger+scrim+switchPanel close */
-function toggleSidebar(){
+function setSidebarOpen(open){
   const sb=document.querySelector('.sidebar');
-  const scrim=document.getElementById('sidebar-scrim');
-  const hb=document.getElementById('hamburger');
-  const open=!sb.classList.contains('open');
+  if(!sb)return;
   sb.classList.toggle('open',open);
-  scrim?.classList.toggle('open',open);
-  hb?.setAttribute('aria-expanded',open?'true':'false');
+  document.getElementById('sidebar-scrim')?.classList.toggle('open',open);
+  document.getElementById('hamburger')?.setAttribute('aria-expanded',open?'true':'false');
+  try{localStorage.setItem('aethySidebarOpen',open?'1':'0');}catch(e){}
+}
+function toggleSidebar(){
+  setSidebarOpen(!document.querySelector('.sidebar')?.classList.contains('open'));
 }
 function closeSidebar(){
-  const sb=document.querySelector('.sidebar');
-  if(!sb||!sb.classList.contains('open'))return;
-  sb.classList.remove('open');
-  document.getElementById('sidebar-scrim')?.classList.remove('open');
-  document.getElementById('hamburger')?.setAttribute('aria-expanded','false');
+  if(!document.querySelector('.sidebar')?.classList.contains('open'))return;
+  setSidebarOpen(false);
+}
+// Restore drawer state (mobile only; desktop sidebar is always visible regardless of .open)
+function restoreSidebarState(){
+  try{
+    if(localStorage.getItem('aethySidebarOpen')==='1' && window.matchMedia('(max-width:768px)').matches){
+      setSidebarOpen(true);
+    }
+  }catch(e){}
 }
 
 // stats
@@ -2179,11 +2187,20 @@ function fillProductSelect(selectedId=null){
   const sel=document.getElementById('t-product');
   sel.innerHTML=STATE.products.map(p=>`<option value="${p.id}" ${p.id==selectedId?'selected':''}>${p.icon} ${p.name}</option>`).join('');
 }
+// Populate the module datalist with existing modules of the given product (suggestions only; new ones still allowed)
+function fillModuleDatalist(prodId){
+  const dl=document.getElementById('t-module-list');
+  if(!dl)return;
+  const mods=[...new Set(STATE.tasks.filter(t=>t.product_id===prodId).map(t=>t.module).filter(Boolean))].sort();
+  dl.innerHTML=mods.map(m=>`<option value="${m.replace(/"/g,'&quot;')}"></option>`).join('');
+}
 
 function openTaskModal(id=null,defaultProdId=null,defaultMod=null){
   document.getElementById('task-id').value='';
   ['t-name','t-desc'].forEach(i=>{const el=document.getElementById(i);if(el)el.value='';});
-  fillProductSelect(defaultProdId||STATE.products[0]?.id);
+  const initProd=defaultProdId||STATE.products[0]?.id;
+  fillProductSelect(initProd);
+  fillModuleDatalist(initProd);
   document.getElementById('t-module').value=defaultMod||'Backend';
   document.getElementById('t-status').value='todo';
   document.getElementById('t-priority').value='medio';
@@ -2194,6 +2211,7 @@ function openTaskModal(id=null,defaultProdId=null,defaultMod=null){
     document.getElementById('task-modal-title').textContent='Editar Task';
     document.getElementById('task-id').value=id;
     fillProductSelect(t.product_id);
+    fillModuleDatalist(t.product_id);
     document.getElementById('t-module').value=t.module||'Backend';
     document.getElementById('t-name').value=t.name||'';
     document.getElementById('t-desc').value=t.description||'';
@@ -2536,6 +2554,7 @@ async function clearChat(){
 }
 
 document.addEventListener('DOMContentLoaded',()=>{
+  restoreSidebarState();
   const saved=JSON.parse(localStorage.getItem('aethyChat')||'[]');
   saved.forEach(entry=>{
     const role=entry.role;
