@@ -4,7 +4,7 @@ from pymongo import MongoClient
 from pymongo.server_api import ServerApi
 from bson import ObjectId
 from datetime import datetime, timedelta
-import os, json, re, certifi
+import os, json, re, certifi, unicodedata
 
 try:
     from groq import Groq as GroqClient
@@ -23,6 +23,9 @@ MONGODB_DB  = os.environ.get('MONGODB_DB', 'commandcenter')
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
 # Modelo Groq (env var para poder cambiarlo sin redeploy; Qwen3-32B está en preview).
 GROQ_MODEL = os.environ.get('GROQ_MODEL', 'qwen/qwen3-32b')
+# Presupuesto de salida. Qwen3 es reasoning: el razonamiento consume este budget junto con
+# el JSON de tool_calls. 1024 truncaba operaciones multi-tarea; 4096 da margen holgado.
+GROQ_MAX_TOKENS = int(os.environ.get('GROQ_MAX_TOKENS', '4096'))
 
 client = MongoClient(
     MONGODB_URI,
@@ -493,6 +496,23 @@ GROQ_TOOLS = [
         }
     }},
 
+    # ── 4b. List modules of a product ─────────────────────────────────────────
+    {"type": "function", "function": {
+        "name": "list_modules",
+        "description": (
+            "Lista los módulos que YA EXISTEN dentro de un producto (busca por nombre parcial). "
+            "Usala antes de agregar tareas para reutilizar un módulo existente en vez de crear "
+            "variantes duplicadas (Backend vs backend)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "product_name": {"type": "string", "description": "Nombre del producto (parcial)"}
+            },
+            "required": ["product_name"]
+        }
+    }},
+
     # ── 5. Update tasks by name + product ─────────────────────────────────────
     {"type": "function", "function": {
         "name": "update_tasks",
@@ -633,12 +653,46 @@ GROQ_TOOLS = [
 ]
 
 
+def _log_tool_call(tool: str, args, result, finish_reason: str = None):
+    """Audit trail liviano de cada tool call. Nunca debe romper el flujo del chat."""
+    try:
+        db.tool_logs.insert_one({
+            "ts": datetime.utcnow(),
+            "tool": tool,
+            "args": args,
+            "result": result,
+            "ok": not (isinstance(result, dict) and "error" in result),
+            "finish_reason": finish_reason,
+        })
+    except Exception:
+        pass
+
+
+def _norm_module(s: str) -> str:
+    """Normaliza un nombre de módulo para comparar: sin acentos, lower, espacios colapsados."""
+    s = unicodedata.normalize('NFKD', s or '').encode('ascii', 'ignore').decode()
+    return ' '.join(s.lower().split())
+
+
+def _resolve_module(product_id_str: str, requested: str, default: str = "General") -> str:
+    """Si el módulo pedido matchea (normalizado) uno ya existente en el producto, devuelve el
+    nombre canónico existente (evita duplicados por mayúsculas/acentos). Si ninguno encaja,
+    devuelve el pedido tal cual — permite crear módulos nuevos."""
+    name = (requested or default or "General").strip()
+    try:
+        existing = db.tasks.distinct("module", {"product_id": product_id_str})
+    except Exception:
+        existing = []
+    nmap = {_norm_module(m): m for m in existing if m}
+    return nmap.get(_norm_module(name), name)
+
+
 def _insert_tasks(product_id_str: str, default_module: str, tasks: list) -> list:
     """Insert a list of task dicts under the given product_id. Returns created task summaries."""
     now = datetime.utcnow()
     created = []
     for t in tasks:
-        module = t.get("module") or default_module or "General"
+        module = _resolve_module(product_id_str, t.get("module") or default_module, "General")
         status = t.get("status", "todo")
         task_doc = {
             "product_id":  product_id_str,
@@ -662,6 +716,14 @@ def execute_tool(name: str, args: dict):
     try:
         # ── create_product_with_tasks ──────────────────────────────────────────
         if name == "create_product_with_tasks":
+            # Validación previa: no escribir en DB con datos incompletos (evita productos vacíos).
+            if not (args.get("product_name") or "").strip():
+                return {"error": "Falta el nombre del producto."}
+            tasks_raw = args.get("tasks", [])
+            if not isinstance(tasks_raw, list) or not tasks_raw:
+                return {"error": "Hay que crear al menos una tarea junto con el producto."}
+            if any(not (t.get("name") or "").strip() for t in tasks_raw):
+                return {"error": "Todas las tareas deben tener nombre."}
             now = datetime.utcnow()
             product = {
                 "name":        args.get("product_name"),
@@ -676,7 +738,6 @@ def execute_tool(name: str, args: dict):
             prod_result = db.products.insert_one(product)
             product_id_str = str(prod_result.inserted_id)
 
-            tasks_raw = args.get("tasks", [])
             default_module = args.get("module", "General")
             created_tasks = _insert_tasks(product_id_str, default_module, tasks_raw)
 
@@ -695,6 +756,10 @@ def execute_tool(name: str, args: dict):
             product_id_str = str(product["_id"])
 
             tasks_raw = args.get("tasks", [])
+            if not isinstance(tasks_raw, list) or not tasks_raw:
+                return {"error": "No se especificó ninguna tarea para agregar."}
+            if any(not (t.get("name") or "").strip() for t in tasks_raw):
+                return {"error": "Todas las tareas deben tener nombre."}
             default_module = args.get("module", "General")
             created_tasks = _insert_tasks(product_id_str, default_module, tasks_raw)
 
@@ -723,6 +788,15 @@ def execute_tool(name: str, args: dict):
                 "status": t.get("status"), "module": t.get("module"),
                 "priority": t.get("priority"),
             } for t in tasks]
+
+        # ── list_modules ───────────────────────────────────────────────────────
+        elif name == "list_modules":
+            q = args.get("product_name", "")
+            product = db.products.find_one({"name": {"$regex": q, "$options": "i"}})
+            if not product:
+                return {"error": f"No se encontró el producto '{q}'."}
+            mods = [m for m in db.tasks.distinct("module", {"product_id": str(product["_id"])}) if m]
+            return {"product": product["name"], "modules": sorted(mods)}
 
         # ── update_tasks ───────────────────────────────────────────────────────
         elif name == "update_tasks":
@@ -853,6 +927,8 @@ def execute_tool(name: str, args: dict):
 
         # ── create_log ─────────────────────────────────────────────────────────
         elif name == "create_log":
+            if not (args.get("text") or "").strip():
+                return {"error": "El log necesita contenido (text) no vacío."}
             now = datetime.utcnow()
             log = {
                 "type":  args.get("type", "Insight"),
@@ -895,17 +971,22 @@ def chat():
             "• Modificar: update_product (nombre/estado/ícono/color), update_tasks (estado, "
             "prioridad, impacto, etc.), move_tasks (mover tareas a otro producto/módulo).\n"
             "• Eliminar: delete_tasks, delete_product (destructivas).\n"
-            "• Consultar: list_products, list_tasks, get_dev_metrics (avance, % completado, "
-            "tareas por estado, esta semana, progreso por producto).\n"
-            "• Estrategia: create_log (registrar decisión/insight/riesgo/oportunidad).\n\n"
+            "• Consultar: list_products, list_tasks, list_modules (módulos de un producto), "
+            "get_dev_metrics (avance, % completado, tareas por estado, esta semana, progreso por producto).\n"
+            "• Estrategia: create_log (registrar decisión/insight/riesgo/oportunidad/"
+            "aprendizaje/objetivo/hipótesis/hito).\n\n"
             "REGLAS:\n"
             "1. Para crear producto + tareas usá SIEMPRE create_product_with_tasks (nunca por separado).\n"
             "2. Buscás productos y tareas por nombre; no inventes IDs.\n"
-            "3. Para preguntas de avance/estado/reportes usá get_dev_metrics, no adivines números.\n"
-            "4. Las acciones destructivas (delete_*) sólo si el usuario lo pide explícitamente; "
+            "3. Antes de agregar tareas a un producto existente, consultá sus módulos con "
+            "list_modules y REUTILIZÁ los que ya existen (no crees variantes por mayúsculas o "
+            "acentos: 'Backend' y 'backend' son el mismo). Creá un módulo nuevo sólo si el "
+            "usuario lo pide explícitamente o si ninguno encaja.\n"
+            "4. Para preguntas de avance/estado/reportes usá get_dev_metrics, no adivines números.\n"
+            "5. Las acciones destructivas (delete_*) sólo si el usuario lo pide explícitamente; "
             "si hay ambigüedad, preguntá antes.\n"
-            "5. Confirmá siempre con un resumen breve de lo que hiciste.\n"
-            "6. Al usar create_log, guardá el texto COMPLETO y literal: nunca lo resumas, "
+            "6. Confirmá siempre con un resumen breve de lo que hiciste.\n"
+            "7. Al usar create_log, guardá el texto COMPLETO y literal: nunca lo resumas, "
             "trunques ni agregues marcadores como '[...]' o 'ver detalles completos'."
         )
     }
@@ -927,7 +1008,7 @@ def chat():
                 messages=all_messages,
                 tools=GROQ_TOOLS,
                 tool_choice="auto",
-                max_tokens=1024,
+                max_tokens=GROQ_MAX_TOKENS,
                 reasoning_format="hidden",
             )
         except Exception as e:
@@ -953,13 +1034,34 @@ def chat():
                 try:
                     tool_args = json.loads(tc.function.arguments)
                 except Exception:
-                    tool_args = {}
+                    # JSON de argumentos truncado/inválido (suele pasar al cortar por límite
+                    # de tokens). NO ejecutamos con {}: eso crea productos vacíos. Devolvemos
+                    # el error al modelo para que reintente fragmentando la operación.
+                    err = {"error": "Argumentos truncados o inválidos. Reintentá la operación "
+                                     "dividiéndola en llamadas más chicas (menos tareas por vez)."}
+                    all_messages.append({
+                        "role": "tool", "tool_call_id": tc.id,
+                        "content": json.dumps(err, ensure_ascii=False)
+                    })
+                    _log_tool_call(tc.function.name, None, err, finish_reason)
+                    continue
                 result = execute_tool(tc.function.name, tool_args)
+                _log_tool_call(tc.function.name, tool_args, result, finish_reason)
                 all_messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
                     "content": json.dumps(result, ensure_ascii=False, default=str)
                 })
+        elif finish_reason == "length":
+            # La respuesta se cortó por límite de tokens (no por terminar). Avisamos en vez de
+            # devolver texto parcial silenciosamente. Preservamos lo ya creado vía refresh.
+            partial = strip_think(message.content) or ""
+            note = ("⚠️ La respuesta se truncó por longitud. "
+                    "Si pediste varias tareas a la vez, probá dividirlo en partes más chicas.")
+            return jsonify({
+                "response": (partial + "\n\n" + note) if partial else note,
+                "refresh": did_tool_calls
+            })
         else:
             return jsonify({
                 "response": strip_think(message.content) or "Acción completada.",
