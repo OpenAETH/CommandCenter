@@ -494,11 +494,17 @@ GROQ_TOOLS = [
     # ── 4. List tasks ──────────────────────────────────────────────────────────
     {"type": "function", "function": {
         "name": "list_tasks",
-        "description": "Lista tareas. Si se pasa product_name, filtra por ese producto (búsqueda por nombre).",
+        "description": (
+            "Lista tareas. Filtros opcionales: product_name (producto, por nombre parcial) y "
+            "module (módulo dentro de ese producto, ej: 'IA', 'Backend'; ignora acentos y "
+            "mayúsculas). Para '¿qué tareas hay en el módulo X de Y?' pasá product_name=Y y "
+            "module=X en una sola llamada; no traigas todo para filtrar a mano."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
-                "product_name": {"type": "string", "description": "Nombre del producto para filtrar (opcional)"}
+                "product_name": {"type": "string", "description": "Nombre del producto para filtrar (opcional)"},
+                "module":       {"type": "string", "description": "Módulo para filtrar dentro del producto (opcional)"}
             }
         }
     }},
@@ -852,17 +858,45 @@ def execute_tool(name: str, args: dict):
         # ── list_tasks ─────────────────────────────────────────────────────────
         elif name == "list_tasks":
             q = args.get("product_name", "")
+            q_module = (args.get("module") or "").strip()
             query = {}
+            product = None
             if q:
                 product = db.products.find_one({"name": {"$regex": q, "$options": "i"}})
-                if product:
-                    query["product_id"] = str(product["_id"])
-            tasks = list(db.tasks.find(query).limit(60))
-            return [{
-                "id": str(t["_id"]), "name": t["name"],
-                "status": t.get("status"), "module": t.get("module"),
-                "priority": t.get("priority"),
-            } for t in tasks]
+                if not product:
+                    # Avisar explícitamente en vez de devolver lista vacía (que el modelo
+                    # podría malinterpretar como "no hay tareas" e inventar una respuesta).
+                    return {"error": f"No se encontró el producto '{q}'. Usá list_products "
+                                     f"para ver los nombres exactos."}
+                query["product_id"] = str(product["_id"])
+
+            # Filtro por módulo en servidor: comparación normalizada (sin acentos, lower),
+            # así 'IA' = 'ia', 'Backend' = 'backend'. Evita traer todo y filtrar a mano.
+            if q_module:
+                norm = _norm_module(q_module)
+                scope = {"product_id": query["product_id"]} if "product_id" in query else {}
+                existing = [m for m in db.tasks.distinct("module", scope) if m]
+                matches = [m for m in existing if _norm_module(m) == norm]
+                if not matches:
+                    return {"error": f"No se encontró el módulo '{q_module}'"
+                                     + (f" en '{product['name']}'" if product else "")
+                                     + ". Módulos disponibles: "
+                                     + (", ".join(sorted(existing)) or "ninguno") + "."}
+                query["module"] = {"$in": matches}
+
+            LIMIT = 200
+            total = db.tasks.count_documents(query)
+            tasks = list(db.tasks.find(query).limit(LIMIT))
+            return {
+                "total": total,
+                "shown": len(tasks),
+                "truncated": total > len(tasks),  # si True, avisá que hay más de las mostradas
+                "tasks": [{
+                    "id": str(t["_id"]), "name": t["name"],
+                    "status": t.get("status"), "module": t.get("module"),
+                    "priority": t.get("priority"),
+                } for t in tasks],
+            }
 
         # ── list_modules ───────────────────────────────────────────────────────
         elif name == "list_modules":
