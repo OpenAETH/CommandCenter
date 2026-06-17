@@ -78,6 +78,7 @@ El frontend es un SPA de pagina unica servido directamente por Flask como string
 - **Reasoning oculto**: el modelo Qwen3 emite bloques `<think>...</think>` internos. Se ocultan via `reasoning_format="hidden"` y se limpian con `strip_think()` como respaldo.
 - **Budget para reasoning + tools**: Qwen3 es un modelo reasoning; el razonamiento consume el mismo presupuesto de salida (`max_tokens`) que el JSON de los tool calls. Por eso `GROQ_MAX_TOKENS` arranca en 4096 (un valor bajo trunca operaciones multi-tarea). El loop detecta `finish_reason == "length"` y avisa en vez de devolver una respuesta parcial; ante un JSON de argumentos truncado devuelve el error al modelo para que reintente fragmentando, en lugar de ejecutar con datos incompletos.
 - **Modulos reutilizables**: al agregar tareas, el modulo pedido se resuelve contra los ya existentes del producto (normalizando mayusculas/acentos), evitando duplicados como `Backend` vs `backend`. Solo crea un modulo nuevo si ninguno encaja.
+- **Reintentos solo ante fallos transitorios**: las llamadas a Groq pasan por `_groq_create`, que reintenta con backoff exponencial + jitter unicamente ante 429/5xx/errores de red. Los errores de cliente (400/401) se propagan al instante: reintentarlos no ayudaria.
 
 ---
 
@@ -204,6 +205,7 @@ tool_logs                           (auditoria de tool calls de AETHY)
 | `GROQ_API_KEY` | API key de Groq (habilita el chatbot) | No | -- |
 | `GROQ_MODEL` | Modelo Groq a usar | No | `qwen/qwen3-32b` |
 | `GROQ_MAX_TOKENS` | Presupuesto de tokens de salida (reasoning + tool calls) | No | `4096` |
+| `GROQ_MAX_RETRIES` | Reintentos ante fallos transitorios de Groq (429/5xx/red) con backoff exponencial | No | `3` |
 | `PORT` | Puerto de escucha (inyectado por Render) | Si (auto) | -- |
 
 ---

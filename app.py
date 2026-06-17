@@ -4,7 +4,7 @@ from pymongo import MongoClient
 from pymongo.server_api import ServerApi
 from bson import ObjectId
 from datetime import datetime, timedelta
-import os, json, re, certifi, unicodedata
+import os, json, re, certifi, unicodedata, time, random
 
 try:
     from groq import Groq as GroqClient
@@ -26,6 +26,8 @@ GROQ_MODEL = os.environ.get('GROQ_MODEL', 'qwen/qwen3-32b')
 # Presupuesto de salida. Qwen3 es reasoning: el razonamiento consume este budget junto con
 # el JSON de tool_calls. 1024 truncaba operaciones multi-tarea; 4096 da margen holgado.
 GROQ_MAX_TOKENS = int(os.environ.get('GROQ_MAX_TOKENS', '4096'))
+# Reintentos ante fallos transitorios de Groq (rate-limit 429 / 5xx / errores de red).
+GROQ_MAX_RETRIES = int(os.environ.get('GROQ_MAX_RETRIES', '3'))
 
 client = MongoClient(
     MONGODB_URI,
@@ -948,6 +950,33 @@ def execute_tool(name: str, args: dict):
         return {"error": str(e)}
 
 
+def _is_transient_groq_error(e) -> bool:
+    """True si conviene reintentar: rate-limit (429), errores de servidor (5xx) o de red.
+    Los errores de cliente (400/401/404, etc.) NO son transitorios: reintentar no ayuda."""
+    status = getattr(e, "status_code", None) or getattr(e, "status", None)
+    if status is None:
+        # Sin status (timeouts, conexión cortada, DNS) → tratar como transitorio.
+        return True
+    return status == 429 or 500 <= status < 600
+
+
+def _groq_create(**kwargs):
+    """Llama a Groq con backoff exponencial + jitter ante fallos transitorios.
+    Reintenta hasta GROQ_MAX_RETRIES; re-lanza de inmediato los errores no transitorios."""
+    last_exc = None
+    for attempt in range(GROQ_MAX_RETRIES + 1):
+        try:
+            return groq_client.chat.completions.create(**kwargs)
+        except Exception as e:
+            last_exc = e
+            if attempt >= GROQ_MAX_RETRIES or not _is_transient_groq_error(e):
+                raise
+            # backoff exponencial (0.5, 1, 2, …) + jitter para evitar thundering herd
+            delay = 0.5 * (2 ** attempt) + random.uniform(0, 0.25)
+            time.sleep(delay)
+    raise last_exc  # inalcanzable, por completitud
+
+
 @app.route('/api/chat', methods=['POST'])
 def chat():
     if not groq_client:
@@ -1036,7 +1065,7 @@ def chat():
 
     for _ in range(8):
         try:
-            response = groq_client.chat.completions.create(
+            response = _groq_create(
                 model=GROQ_MODEL,
                 messages=all_messages,
                 tools=GROQ_TOOLS,
