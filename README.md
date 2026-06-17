@@ -17,7 +17,7 @@ Panel de operaciones para startups con **AETHY**, un asistente IA que opera el s
 | **AETHY** | Asistente IA conversacional que crea, lee, modifica y elimina productos/tareas via chat en espanol |
 | **DEV** | Backlog de productos y tareas con estados todo/doing/done, agrupado por modulo |
 | **Campana** | Metricas en vivo: tareas completadas por semana, progreso por producto, % de avance |
-| **Estrategia** | Bitacora tipo "segundo cerebro": decisiones, insights, riesgos y oportunidades |
+| **Estrategia** | Bitacora tipo "segundo cerebro": decisiones, insights, riesgos, oportunidades, aprendizajes, objetivos, hipotesis e hitos |
 | **Guia** | Panel de referencia interna con tips de uso diario |
 | **Sin build steps** | Un solo `pip install`, una variable de entorno, y ya corre |
 
@@ -76,28 +76,31 @@ El frontend es un SPA de pagina unica servido directamente por Flask como string
 - **Monolito deliberado**: un solo archivo (`app.py`) contiene backend, API, chatbot y frontend. Sin npm, sin build steps, sin carpetas static/. Deploy inmediato.
 - **Metricas derivadas**: el panel Campana no almacena datos propios. Todas las metricas (progreso, completados por semana, % por producto) se calculan en vivo desde `products` y `tasks`.
 - **Reasoning oculto**: el modelo Qwen3 emite bloques `<think>...</think>` internos. Se ocultan via `reasoning_format="hidden"` y se limpian con `strip_think()` como respaldo.
+- **Budget para reasoning + tools**: Qwen3 es un modelo reasoning; el razonamiento consume el mismo presupuesto de salida (`max_tokens`) que el JSON de los tool calls. Por eso `GROQ_MAX_TOKENS` arranca en 4096 (un valor bajo trunca operaciones multi-tarea). El loop detecta `finish_reason == "length"` y avisa en vez de devolver una respuesta parcial; ante un JSON de argumentos truncado devuelve el error al modelo para que reintente fragmentando, en lugar de ejecutar con datos incompletos.
+- **Modulos reutilizables**: al agregar tareas, el modulo pedido se resuelve contra los ya existentes del producto (normalizando mayusculas/acentos), evitando duplicados como `Backend` vs `backend`. Solo crea un modulo nuevo si ninguno encaja.
 
 ---
 
 ## Asistente IA — AETHY
 
-El endpoint `POST /api/chat` expone **AETHY**, un agente Groq con function calling que opera directamente sobre la base de datos. Responde en espanol, mantiene contexto de 12 turnos y ejecuta hasta 8 iteraciones tool-call por mensaje.
+El endpoint `POST /api/chat` expone **AETHY**, un agente Groq con function calling que opera directamente sobre la base de datos. Responde en espanol, mantiene contexto de 12 turnos y ejecuta hasta 8 iteraciones tool-call por mensaje. Cada tool call se persiste en `tool_logs` (auditoria liviana: timestamp, args, resultado, ok, finish_reason).
 
-### Las 11 herramientas
+### Las 12 herramientas
 
 | Tool | Que hace | Comportamiento |
 |------|----------|---------------|
-| `create_product_with_tasks` | Crea un producto + N tareas en una sola operacion atomica | Busca por nombre internamente |
+| `create_product_with_tasks` | Crea un producto + N tareas en una sola operacion atomica | Busca por nombre internamente; valida antes de escribir |
 | `add_tasks_to_product` | Agrega tareas a un producto existente | Busca producto por nombre parcial |
 | `list_products` | Lista productos con id, nombre y estado | Sin parametros |
 | `list_tasks` | Lista tareas, opcionalmente filtradas por producto | Filtro por nombre parcial |
+| `list_modules` | Lista los modulos existentes de un producto | Para reutilizar modulos y no duplicarlos |
 | `update_tasks` | Actualiza status/priority/impact/module de una o varias tareas | Busca por nombre + producto |
 | `update_product` | Modifica nombre/icono/descripcion/status/color de un producto | Busca por nombre parcial |
 | `move_tasks` | Mueve tareas a otro producto y/o cambia su modulo | Busca por nombre parcial |
 | `delete_tasks` | Elimina tareas especificas | **Destructiva** — solo si el usuario lo pide explicitamente |
 | `delete_product` | Elimina un producto y TODAS sus tareas en cascada | **Destructiva** — requiere confirmacion explicita |
 | `get_dev_metrics` | Devuelve metricas agregadas: productos, tareas por estado, % completado, completadas esta semana, progreso por producto | Sin parametros |
-| `create_log` | Registra entrada en bitacora estrategica (Decision/Insight/Riesgo/Oportunidad) | Guarda texto COMPLETO y literal |
+| `create_log` | Registra entrada en bitacora estrategica (Decision/Insight/Riesgo/Oportunidad/Aprendizaje/Objetivo/Hipotesis/Hito) | Guarda texto COMPLETO y literal |
 
 > El modelo `qwen/qwen3-32b` es un modelo *reasoning*: emite bloques `<think>...</think>` internos. La app los oculta automaticamente.
 
@@ -146,7 +149,7 @@ Todos los endpoints responden y consumen `application/json`. No hay autenticacio
 
 | Metodo | Ruta | Descripcion |
 |--------|------|-------------|
-| POST | `/api/chat` | Agente Groq AETHY con 11 tools sobre productos/tareas |
+| POST | `/api/chat` | Agente Groq AETHY con 12 tools sobre productos/tareas |
 | GET | `/api/stats` | Contadores agregados (tasks, productos, logs) |
 | GET | `/api/health` | Verifica conexion a Mongo y disponibilidad de Groq |
 | GET | `/` | Sirve el frontend HTML completo (SPA) |
@@ -170,12 +173,22 @@ products                            tasks
                                     +-- created_at
 strategy_logs                       +-- updated_at
 +-- _id
-+-- type        (Decision|Insight|Riesgo|Oportunidad)
++-- type        (Decision|Insight|Riesgo|Oportunidad|
+|                Aprendizaje|Objetivo|Hipotesis|Hito)
 +-- title
 +-- text
 +-- links       (array de strings)
 +-- date
 +-- created_at
+
+tool_logs                           (auditoria de tool calls de AETHY)
++-- _id
++-- ts          (timestamp UTC)
++-- tool        (nombre de la herramienta)
++-- args        (argumentos recibidos)
++-- result      (valor devuelto)
++-- ok          (bool — false si result trae error)
++-- finish_reason
 ```
 
 > Las colecciones `campaigns` (del modulo anterior de campanas manuales) y `contacts` (del antiguo modulo CRM, migrado a otra app) pueden existir en la base pero **ya no son usadas** por esta aplicacion.
@@ -190,6 +203,7 @@ strategy_logs                       +-- updated_at
 | `MONGODB_DB` | Nombre de la base | No | `commandcenter` |
 | `GROQ_API_KEY` | API key de Groq (habilita el chatbot) | No | -- |
 | `GROQ_MODEL` | Modelo Groq a usar | No | `qwen/qwen3-32b` |
+| `GROQ_MAX_TOKENS` | Presupuesto de tokens de salida (reasoning + tool calls) | No | `4096` |
 | `PORT` | Puerto de escucha (inyectado por Render) | Si (auto) | -- |
 
 ---
@@ -249,7 +263,7 @@ El SPA incluye cuatro secciones navegables por teclado (`1`-`4`) o clic, mas el 
 |-------|-------|-------------|
 | **DEV** | `1` | Backlog de tareas agrupadas por producto y modulo, con toggle de completado, folding de modulos, CRUD desde la UI y progreso en tiempo real. Panel por defecto. |
 | **Campana** | `2` | Metricas derivadas de DEV: cards de estado (todo/doing/done), grafico Chart.js semanal (barras), doughnut de completitud y progreso por producto. |
-| **Estrategia** | `3` | Bitacora de decisiones, insights, riesgos y oportunidades con filtrado por tipo y CRUD completo. |
+| **Estrategia** | `3` | Bitacora de decisiones, insights, riesgos, oportunidades, aprendizajes, objetivos, hipotesis e hitos, con filtrado por tipo y CRUD completo. |
 | **Guia** | `4` | Panel de referencia interna con cards de help desk, tips de uso diario y documentacion de AETHY. |
 
 Atajos de teclado:
@@ -286,7 +300,7 @@ Command Core es parte del ecosistema **AETHERYON**, una suite de herramientas pa
 
 ```
 .
-+-- app.py                     # Aplicacion completa (API + chatbot + frontend embebido, 2602 lines)
++-- app.py                     # Aplicacion completa (API + chatbot + frontend embebido, 2728 lines)
 +-- requirements.txt           # Dependencias Python (7 paquetes)
 +-- render.yaml                # Configuracion de deploy en Render
 +-- Cognis-PromptForge.md      # Documentacion de diseno: PromptForge (herramienta hermana)
