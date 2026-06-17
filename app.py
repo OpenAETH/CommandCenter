@@ -614,14 +614,14 @@ GROQ_TOOLS = [
     {"type": "function", "function": {
         "name": "create_log",
         "description": (
-            "Registra una entrada en Estrategia: una decisión, insight, riesgo u oportunidad "
-            "que surja de la conversación. Útil para capturar aprendizajes. "
+            "Registra una entrada en Estrategia: decisión, insight, riesgo, oportunidad, "
+            "aprendizaje, objetivo, hipótesis o hito que surja de la conversación. Útil para capturar aprendizajes. "
             "Guardá el contenido COMPLETO y literal: no resumas ni trunques."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "type":  {"type": "string", "enum": ["Decision","Insight","Riesgo","Oportunidad"]},
+                "type":  {"type": "string", "enum": ["Decision","Insight","Riesgo","Oportunidad","Aprendizaje","Objetivo","Hipótesis","Hito"]},
                 "title": {"type": "string", "description": "Título breve."},
                 "text":  {"type": "string", "description": "Contenido COMPLETO y literal del log. No resumas ni trunques; no agregues marcadores tipo '[...]' ni 'ver detalles completos'. Incluí el texto íntegro con todo el contexto."},
                 "links": {"type": "array", "items": {"type": "string"},
@@ -1674,10 +1674,14 @@ input,select,textarea{font-family:inherit;}
       <div class="panel-actions">
         <div id="log-filter" style="display:flex;gap:3px">
           <button class="btn btn-sm active-filter" onclick="setLogFilter(this,'')">Todos</button>
-          <button class="btn btn-sm" onclick="setLogFilter(this,'Decision')">Decisión</button>
-          <button class="btn btn-sm" onclick="setLogFilter(this,'Insight')">Insight</button>
-          <button class="btn btn-sm" onclick="setLogFilter(this,'Riesgo')">Riesgo</button>
-          <button class="btn btn-sm" onclick="setLogFilter(this,'Oportunidad')">Oportunidad</button>
+          <button class="btn btn-sm" onclick="setLogFilter(this,'Decision')">💡 Decisión</button>
+          <button class="btn btn-sm" onclick="setLogFilter(this,'Insight')">🔍 Insight</button>
+          <button class="btn btn-sm" onclick="setLogFilter(this,'Oportunidad')">🚀 Oportunidad</button>
+          <button class="btn btn-sm" onclick="setLogFilter(this,'Riesgo')">⚠️ Riesgo</button>
+          <button class="btn btn-sm" onclick="setLogFilter(this,'Aprendizaje')">🧠 Aprendizaje</button>
+          <button class="btn btn-sm" onclick="setLogFilter(this,'Objetivo')">🎯 Objetivo</button>
+          <button class="btn btn-sm" onclick="setLogFilter(this,'Hipótesis')">🔬 Hipótesis</button>
+          <button class="btn btn-sm" onclick="setLogFilter(this,'Hito')">🏆 Hito</button>
         </div>
         <button class="btn btn-primary" onclick="openLogModal()">+ Log</button>
       </div>
@@ -1936,7 +1940,7 @@ input,select,textarea{font-family:inherit;}
     <div class="modal-body">
       <input type="hidden" id="l-id"/>
       <div class="f-row">
-        <div class="f-group"><label class="f-label">Tipo</label><select class="f-select" id="l-type"><option value="Decision">💡 Decisión</option><option value="Insight">🔍 Insight</option><option value="Riesgo">⚠️ Riesgo</option><option value="Oportunidad">🚀 Oportunidad</option></select></div>
+        <div class="f-group"><label class="f-label">Tipo</label><select class="f-select" id="l-type"><option value="Decision">💡 Decisión</option><option value="Insight">🔍 Insight</option><option value="Oportunidad">🚀 Oportunidad</option><option value="Riesgo">⚠️ Riesgo</option><option value="Aprendizaje">🧠 Aprendizaje</option><option value="Objetivo">🎯 Objetivo</option><option value="Hipótesis">🔬 Hipótesis</option><option value="Hito">🏆 Hito</option></select></div>
         <div class="f-group"><label class="f-label">Fecha</label><input class="f-input" id="l-date" type="date"/></div>
       </div>
       <div class="f-group"><label class="f-label">Título</label><input class="f-input" id="l-title" placeholder="Título breve"/></div>
@@ -1972,7 +1976,8 @@ let logFilter='';
 let modExp={Auth:true,Backend:true,UI:true,'Multi-IA':true};
 let charts={weekly:null,status:null};
 
-const LOG_C={Decision:'#00e5ff',Insight:'#ffd700',Riesgo:'#ff3e5e',Oportunidad:'#39ff14'};
+const LOG_C={Decision:'#00e5ff',Insight:'#ffd700',Riesgo:'#ff3e5e',Oportunidad:'#39ff14',Aprendizaje:'#b388ff',Objetivo:'#ff9100','Hipótesis':'#18ffff',Hito:'#ffab00'};
+const LOG_I={Decision:'💡',Insight:'🔍',Riesgo:'⚠️',Oportunidad:'🚀',Aprendizaje:'🧠',Objetivo:'🎯','Hipótesis':'🔬',Hito:'🏆'};
 const MODS=['Auth','Backend','UI','Multi-IA'];
 
 // clock
@@ -2374,7 +2379,7 @@ function renderStrategy(){
         <button class="btn btn-sm btn-icon log-edit" onclick="event.stopPropagation();editLog('${l.id}')" title="Editar">✎</button>
         <button class="btn btn-sm btn-danger btn-icon log-del" onclick="event.stopPropagation();deleteLog('${l.id}')" title="Eliminar">✕</button>
       </div>
-      <div class="log-header"><span class="log-badge">${l.type}</span>${l.title?`<span class="log-title">${l.title}</span>`:''}<span class="log-date">${l.date||''}</span></div>
+      <div class="log-header"><span class="log-badge">${LOG_I[l.type]?LOG_I[l.type]+' ':''}${l.type}</span>${l.title?`<span class="log-title">${l.title}</span>`:''}<span class="log-date">${l.date||''}</span></div>
       <div class="log-text" onclick="toggleLogText(this)">${l.text}</div>
       ${links.length?`<div class="log-links">${links.map(lk=>`<span class="log-link-tag">🔗 ${lk}</span>`).join('')}</div>`:''}</div>`;
   }).join('');
