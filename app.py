@@ -24,10 +24,15 @@ GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
 # Modelo Groq (env var para poder cambiarlo sin redeploy; Qwen3-32B está en preview).
 GROQ_MODEL = os.environ.get('GROQ_MODEL', 'qwen/qwen3-32b')
 # Presupuesto de salida. Qwen3 es reasoning: el razonamiento consume este budget junto con
-# el JSON de tool_calls. 1024 truncaba operaciones multi-tarea; 4096 da margen holgado.
-GROQ_MAX_TOKENS = int(os.environ.get('GROQ_MAX_TOKENS', '4096'))
+# el JSON de tool_calls. OJO: Groq cuenta input+max_tokens contra el límite de TPM (6000 en
+# el tier gratis), así que un max_tokens alto solo dispara 413 'request too large'. Con tools
+# de a una y reasoning_format='hidden', 2048 alcanza para una operación por paso sin truncar.
+GROQ_MAX_TOKENS = int(os.environ.get('GROQ_MAX_TOKENS', '2048'))
 # Reintentos ante fallos transitorios de Groq (rate-limit 429 / 5xx / errores de red).
 GROQ_MAX_RETRIES = int(os.environ.get('GROQ_MAX_RETRIES', '3'))
+# Pausa (ms) entre pasos del loop de tools, para no acumular requests dentro de la misma
+# ventana de TPM (rate-limit por minuto). El Sync 1×1 ejecuta una tool por paso y espera esto.
+GROQ_THROTTLE_MS = int(os.environ.get('GROQ_THROTTLE_MS', '350'))
 
 client = MongoClient(
     MONGODB_URI,
@@ -655,6 +660,90 @@ GROQ_TOOLS = [
 ]
 
 
+# Índice por nombre para armar subconjuntos sin recorrer la lista entera.
+GROQ_TOOLS_BY_NAME = {t["function"]["name"]: t for t in GROQ_TOOLS}
+
+# Grupos de herramientas por tipo de acción. Las de lectura son baratas (~330 tk juntas) y
+# casi siempre útiles para resolver nombres/módulos antes de escribir, así que se incluyen
+# en cualquier pedido accionable. Las destructivas y el pesado create_product_with_tasks
+# sólo se mandan ante señales explícitas, para no inflar el request contra el TPM de Groq.
+_TOOLS_READ    = ["list_products", "list_tasks", "list_modules", "get_dev_metrics"]
+_TOOLS_CREATE  = ["create_product_with_tasks", "add_tasks_to_product"]
+_TOOLS_UPDATE  = ["update_tasks", "update_product", "move_tasks"]
+_TOOLS_DELETE  = ["delete_tasks", "delete_product"]
+_TOOLS_LOG     = ["create_log"]
+
+# Disparadores normalizados (sin acentos, lower). Si ninguno matchea y tampoco hay señal de
+# escritura, el mensaje se trata como conversacional → se mandan 0 tools.
+_KW_CREATE = ("crear", "creá", "crea ", "nuevo", "nueva", "agrega", "agregá", "añad",
+              "sumar", "sumá", "volca", "volcá", "anota", "anotá", "necesito hacer",
+              "tengo en la cabeza", "armar", "armá", "dar de alta")
+_KW_UPDATE = ("actualiz", "cambia", "cambiá", "modific", "marca", "marcá", "mover", "mové",
+              "mueve", "pasar a", "pasá a", "termin", "avanc", "complet", "hecho", "listo",
+              "done", "doing", "prioridad", "impacto", "estado", "renombr", "pausar", "archivar")
+_KW_DELETE = ("elimina", "eliminá", "borra", "borrá", "quita", "quitá", "elimin", "borrar",
+              "remover", "remové", "deshacer")
+_KW_LOG    = ("decid", "aprend", "insight", "riesgo", "oportunidad", "objetivo", "hipotesis",
+              "hito", "registr", "log ", "bitacora", "me di cuenta", "anotar decision",
+              "nota estrategica", "elegi", "elegí", "descart", "vamos con")
+_KW_READ   = ("lista", "listá", "mostra", "mostrá", "cuant", "cuánt", "avance", "estado",
+              "progreso", "metric", "métric", "reporte", "resumen", "que tengo", "qué tengo",
+              "ver ", "consult")
+
+
+def _select_tools(messages):
+    """Devuelve el subconjunto de GROQ_TOOLS relevante al último mensaje del usuario.
+    Reduce el tamaño del request (clave para el límite de TPM de Groq): un saludo no lleva
+    tools, una consulta lleva sólo lecturas, una escritura lleva lecturas + el grupo que toca.
+    Ante la duda incluye de más (nunca de menos), salvo destructivas que exigen señal explícita.
+    Devuelve None si no aplica ninguna tool (mensaje conversacional)."""
+    last_user = ""
+    for m in reversed(messages):
+        if m.get("role") == "user" and m.get("content"):
+            last_user = m["content"]
+            break
+    txt = unicodedata.normalize('NFKD', last_user).encode('ascii', 'ignore').decode().lower()
+
+    def _strip(k):
+        return unicodedata.normalize('NFKD', k).encode('ascii', 'ignore').decode().lower()
+
+    def has(kws):
+        # Normalizamos también las keywords: txt va sin acentos, así 'mové'/'creá' matchean.
+        return any(_strip(k) in txt for k in kws)
+
+    names = []
+    is_create = has(_KW_CREATE)
+    is_update = has(_KW_UPDATE)
+    is_delete = has(_KW_DELETE)
+    is_log    = has(_KW_LOG)
+    is_read   = has(_KW_READ)
+
+    if is_create:
+        names += _TOOLS_CREATE
+    if is_update:
+        names += _TOOLS_UPDATE
+    if is_delete:
+        names += _TOOLS_DELETE
+    if is_log:
+        names += _TOOLS_LOG
+
+    any_write = is_create or is_update or is_delete or is_log
+    if any_write or is_read:
+        # Cualquier acción o consulta necesita las lecturas para resolver nombres/módulos.
+        names = _TOOLS_READ + names
+
+    if not names:
+        return None  # conversacional puro → sin tools, request mínimo
+
+    # Dedup preservando orden, y materializar los schemas.
+    seen, ordered = set(), []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            ordered.append(GROQ_TOOLS_BY_NAME[n])
+    return ordered
+
+
 def _log_tool_call(tool: str, args, result, finish_reason: str = None):
     """Audit trail liviano de cada tool call. Nunca debe romper el flujo del chat."""
     try:
@@ -960,9 +1049,21 @@ def _is_transient_groq_error(e) -> bool:
     return status == 429 or 500 <= status < 600
 
 
+def _groq_retry_after(e):
+    """Segundos a esperar según el header 'retry-after' del 429, si viene. None si no."""
+    resp = getattr(e, "response", None)
+    headers = getattr(resp, "headers", None) or {}
+    val = headers.get("retry-after") or headers.get("Retry-After")
+    try:
+        return float(val) if val is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _groq_create(**kwargs):
     """Llama a Groq con backoff exponencial + jitter ante fallos transitorios.
-    Reintenta hasta GROQ_MAX_RETRIES; re-lanza de inmediato los errores no transitorios."""
+    Reintenta hasta GROQ_MAX_RETRIES; re-lanza de inmediato los errores no transitorios.
+    En rate-limit (429) respeta el header 'retry-after' de Groq si está presente."""
     last_exc = None
     for attempt in range(GROQ_MAX_RETRIES + 1):
         try:
@@ -971,8 +1072,13 @@ def _groq_create(**kwargs):
             last_exc = e
             if attempt >= GROQ_MAX_RETRIES or not _is_transient_groq_error(e):
                 raise
-            # backoff exponencial (0.5, 1, 2, …) + jitter para evitar thundering herd
-            delay = 0.5 * (2 ** attempt) + random.uniform(0, 0.25)
+            # Groq nos dice cuánto esperar en un 429; respetarlo evita reintentos que rebotan.
+            retry_after = _groq_retry_after(e)
+            if retry_after is not None:
+                delay = min(retry_after, 10) + random.uniform(0, 0.25)
+            else:
+                # backoff exponencial (0.5, 1, 2, …) + jitter para evitar thundering herd
+                delay = 0.5 * (2 ** attempt) + random.uniform(0, 0.25)
             time.sleep(delay)
     raise last_exc  # inalcanzable, por completitud
 
@@ -1069,7 +1175,10 @@ def chat():
             "si hay ambigüedad, preguntá antes.\n"
             "6. Confirmá siempre con un resumen breve de lo que hiciste.\n"
             "7. Al usar create_log, guardá el texto COMPLETO y literal: nunca lo resumas, "
-            "trunques ni agregues marcadores como '[...]' o 'ver detalles completos'."
+            "trunques ni agregues marcadores como '[...]' o 'ver detalles completos'.\n"
+            "8. Ejecutá UNA herramienta por paso (Sync 1×1): pedí una sola tool, esperá su "
+            "resultado y recién entonces decidí la siguiente. No agrupes varias tool_calls en "
+            "un mismo turno; si una operación necesita varios pasos, hacelos de a uno."
         )
     }
 
@@ -1083,16 +1192,25 @@ def chat():
 
     did_tool_calls = False
 
-    for _ in range(8):
+    # Subconjunto de tools relevante al pedido: baja el tamaño del request para no chocar con
+    # el límite de TPM de Groq. None = mensaje conversacional, no mandamos tools.
+    active_tools = _select_tools(messages)
+
+    for step in range(8):
+        # Pacing entre pasos del Sync 1×1: separa los requests dentro de la ventana de TPM.
+        if step > 0 and GROQ_THROTTLE_MS > 0:
+            time.sleep(GROQ_THROTTLE_MS / 1000.0)
         try:
-            response = _groq_create(
+            create_kwargs = dict(
                 model=GROQ_MODEL,
                 messages=all_messages,
-                tools=GROQ_TOOLS,
-                tool_choice="auto",
                 max_tokens=GROQ_MAX_TOKENS,
                 reasoning_format="hidden",
             )
+            if active_tools:
+                create_kwargs["tools"] = active_tools
+                create_kwargs["tool_choice"] = "auto"
+            response = _groq_create(**create_kwargs)
         except Exception as e:
             return jsonify({'response': f'Error Groq: {str(e)}', 'refresh': did_tool_calls})
 
@@ -2726,8 +2844,8 @@ async function sendChat(){
   showTyping();
   document.getElementById('chat-send').disabled=true;
   try{
-    // Send only last 12 turns to avoid token overflow
-    const msgs=chatHistory.slice(-12);
+    // Send only last 8 turns to avoid token overflow (TPM de Groq cuenta el historial)
+    const msgs=chatHistory.slice(-8);
     const res=await fetch('/api/chat',{
       method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({messages:msgs})
