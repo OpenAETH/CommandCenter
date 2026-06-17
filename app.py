@@ -664,39 +664,37 @@ GROQ_TOOLS = [
 GROQ_TOOLS_BY_NAME = {t["function"]["name"]: t for t in GROQ_TOOLS}
 
 # Grupos de herramientas por tipo de acción. Las de lectura son baratas (~330 tk juntas) y
-# casi siempre útiles para resolver nombres/módulos antes de escribir, así que se incluyen
-# en cualquier pedido accionable. Las destructivas y el pesado create_product_with_tasks
-# sólo se mandan ante señales explícitas, para no inflar el request contra el TPM de Groq.
+# SEGURAS (idempotentes): se incluyen SIEMPRE, porque un falso negativo en lectura es lo peor
+# que puede pasar — el modelo, sin la tool, inventa los datos en vez de consultarlos (alucina).
+# Las escrituras/destructivas son los schemas pesados; ésas sí se gatean por intención para
+# achicar el request contra el TPM de Groq. Un falso positivo de escritura sólo cuesta tokens;
+# tool_choice='auto' hace que el modelo no la use si el mensaje no la pide.
 _TOOLS_READ    = ["list_products", "list_tasks", "list_modules", "get_dev_metrics"]
 _TOOLS_CREATE  = ["create_product_with_tasks", "add_tasks_to_product"]
 _TOOLS_UPDATE  = ["update_tasks", "update_product", "move_tasks"]
 _TOOLS_DELETE  = ["delete_tasks", "delete_product"]
 _TOOLS_LOG     = ["create_log"]
 
-# Disparadores normalizados (sin acentos, lower). Si ninguno matchea y tampoco hay señal de
-# escritura, el mensaje se trata como conversacional → se mandan 0 tools.
+# Disparadores normalizados (sin acentos, lower) para sumar los grupos de ESCRITURA. Ante la
+# duda incluímos de más; sólo las destructivas exigen una señal explícita de borrado.
 _KW_CREATE = ("crear", "creá", "crea ", "nuevo", "nueva", "agrega", "agregá", "añad",
               "sumar", "sumá", "volca", "volcá", "anota", "anotá", "necesito hacer",
               "tengo en la cabeza", "armar", "armá", "dar de alta")
 _KW_UPDATE = ("actualiz", "cambia", "cambiá", "modific", "marca", "marcá", "mover", "mové",
               "mueve", "pasar a", "pasá a", "termin", "avanc", "complet", "hecho", "listo",
-              "done", "doing", "prioridad", "impacto", "estado", "renombr", "pausar", "archivar")
+              "done", "doing", "prioridad", "impacto", "renombr", "pausar", "archivar")
 _KW_DELETE = ("elimina", "eliminá", "borra", "borrá", "quita", "quitá", "elimin", "borrar",
               "remover", "remové", "deshacer")
 _KW_LOG    = ("decid", "aprend", "insight", "riesgo", "oportunidad", "objetivo", "hipotesis",
               "hito", "registr", "log ", "bitacora", "me di cuenta", "anotar decision",
               "nota estrategica", "elegi", "elegí", "descart", "vamos con")
-_KW_READ   = ("lista", "listá", "mostra", "mostrá", "cuant", "cuánt", "avance", "estado",
-              "progreso", "metric", "métric", "reporte", "resumen", "que tengo", "qué tengo",
-              "ver ", "consult")
 
 
 def _select_tools(messages):
-    """Devuelve el subconjunto de GROQ_TOOLS relevante al último mensaje del usuario.
-    Reduce el tamaño del request (clave para el límite de TPM de Groq): un saludo no lleva
-    tools, una consulta lleva sólo lecturas, una escritura lleva lecturas + el grupo que toca.
-    Ante la duda incluye de más (nunca de menos), salvo destructivas que exigen señal explícita.
-    Devuelve None si no aplica ninguna tool (mensaje conversacional)."""
+    """Devuelve el subconjunto de GROQ_TOOLS para el último mensaje del usuario.
+    Las lecturas van SIEMPRE (baratas y seguras: evitan que el modelo alucine datos que no
+    pudo consultar). Las escrituras se suman por intención, para no inflar el request contra
+    el límite de TPM de Groq. Nunca devuelve None: como mínimo van las 4 lecturas (~331 tk)."""
     last_user = ""
     for m in reversed(messages):
         if m.get("role") == "user" and m.get("content"):
@@ -711,29 +709,15 @@ def _select_tools(messages):
         # Normalizamos también las keywords: txt va sin acentos, así 'mové'/'creá' matchean.
         return any(_strip(k) in txt for k in kws)
 
-    names = []
-    is_create = has(_KW_CREATE)
-    is_update = has(_KW_UPDATE)
-    is_delete = has(_KW_DELETE)
-    is_log    = has(_KW_LOG)
-    is_read   = has(_KW_READ)
-
-    if is_create:
+    names = list(_TOOLS_READ)  # lecturas siempre
+    if has(_KW_CREATE):
         names += _TOOLS_CREATE
-    if is_update:
+    if has(_KW_UPDATE):
         names += _TOOLS_UPDATE
-    if is_delete:
+    if has(_KW_DELETE):
         names += _TOOLS_DELETE
-    if is_log:
+    if has(_KW_LOG):
         names += _TOOLS_LOG
-
-    any_write = is_create or is_update or is_delete or is_log
-    if any_write or is_read:
-        # Cualquier acción o consulta necesita las lecturas para resolver nombres/módulos.
-        names = _TOOLS_READ + names
-
-    if not names:
-        return None  # conversacional puro → sin tools, request mínimo
 
     # Dedup preservando orden, y materializar los schemas.
     seen, ordered = set(), []
@@ -1178,7 +1162,12 @@ def chat():
             "trunques ni agregues marcadores como '[...]' o 'ver detalles completos'.\n"
             "8. Ejecutá UNA herramienta por paso (Sync 1×1): pedí una sola tool, esperá su "
             "resultado y recién entonces decidí la siguiente. No agrupes varias tool_calls en "
-            "un mismo turno; si una operación necesita varios pasos, hacelos de a uno."
+            "un mismo turno; si una operación necesita varios pasos, hacelos de a uno.\n"
+            "9. NUNCA inventes datos. Para listar productos/tareas, métricas o estados SIEMPRE "
+            "llamá la herramienta correspondiente (list_products, list_tasks, get_dev_metrics) "
+            "y respondé SÓLO con lo que devuelva. No anuncies 'Ejecutando…' ni muestres un "
+            "'Resultado:' sin haber llamado realmente la tool. Si la herramienta no está "
+            "disponible o falla, decílo con franqueza; jamás fabriques nombres ni números."
         )
     }
 
