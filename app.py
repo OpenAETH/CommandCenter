@@ -1037,6 +1037,26 @@ def chat():
             "   - links: lista de strings tipo 'DEV→Backend', 'Campaña→Landing'.\n"
             "Si un campo desplegable es ambiguo y no podés inferirlo con confianza, preguntá "
             "antes de asumir; no inventes valores fuera de las listas.\n\n"
+            "ARTEFACTOS DE CONVERSACIÓN (patrones recurrentes; reconocelos por INTENCIÓN, sin "
+            "exigir sintaxis especial; aplicá uno sólo si el match es claro, si no tratá el "
+            "mensaje como pedido normal):\n"
+            "• VOLCADO — el usuario vuelca varias cosas de la cabeza y vos las estructurás en "
+            "tareas. Gatillos: 'tengo en la cabeza…', 'anotá esto', 'volcá:', 'necesito hacer: "
+            "a, b, c'. Acción: partí el texto en N tareas; si nombra un producto existente usá "
+            "add_tasks_to_product, si es nuevo create_product_with_tasks; inferí módulo "
+            "(reutilizando los existentes), prioridad e impacto. Preguntá SÓLO si no queda "
+            "claro a qué producto van. Respondé con el resultado limpio: cuántas tareas y dónde.\n"
+            "• DECISIÓN — el usuario comunica una decisión. Gatillos: 'decidí…', 'elegí X sobre "
+            "Y', 'vamos con…', 'descartamos…'. Acción: create_log type=Decision con el texto "
+            "COMPLETO y literal (incluí el porqué y lo descartado si los menciona); si refiere a "
+            "un producto/módulo agregá links ('DEV→Backend'). Respondé confirmando brevemente.\n"
+            "• BITÁCORA DEL DÍA — cierre de jornada con varias acciones a la vez. Gatillos: 'hoy "
+            "avancé en…', 'lo de hoy:', 'resumen del día', 'me trabé con…'. Mapeo: 'avancé/"
+            "terminé X'→update_tasks (doing/done); 'me trabé con Y'→log Riesgo; 'aprendí Z'→log "
+            "Aprendizaje. IMPORTANTE: este artefacto es compuesto y puede marcar tareas como "
+            "done, así que NO ejecutes de una: primero PRESENTÁ el plan ('voy a: marcar X done, "
+            "crear log Y…') y esperá la confirmación del usuario; recién con su OK ejecutás. "
+            "Preguntá si una tarea mencionada no matchea ninguna existente.\n\n"
             "REGLAS:\n"
             "1. Para crear producto + tareas usá SIEMPRE create_product_with_tasks (nunca por separado).\n"
             "2. Buscás productos y tareas por nombre; no inventes IDs.\n"
@@ -1910,6 +1930,20 @@ input,select,textarea{font-family:inherit;}
             <div class="guide-step"><div class="gsn">4</div><div><div class="gs-title">Eliminar y registrar</div><div class="gs-desc"><em>"borrá la task W"</em>, <em>"registrá esta decisión en Estrategia"</em>. Lo destructivo lo confirma antes.</div></div></div>
           </div>
           <div class="guide-tip"><strong>Tip:</strong> AETHY busca todo por nombre. Los paneles DEV y Campaña se refrescan solos tras cada acción.</div>
+        </div>
+
+        <!-- ARTEFACTOS card -->
+        <div class="guide-card">
+          <div class="guide-card-head">
+            <div class="guide-card-icon">🗣️</div>
+            <div><div class="guide-card-title" style="color:var(--purple-light)">HABLAR CON AETHY</div><div class="guide-card-sub">Artefactos · formas naturales de operar</div></div>
+          </div>
+          <div class="guide-steps">
+            <div class="guide-step"><div class="gsn hl">📥</div><div><div class="gs-title">Volcado</div><div class="gs-desc"><em>"Tengo en la cabeza: arreglar el login, el dashboard carga lento, falta el email de bienvenida"</em> → lo parte en tareas, infiriendo módulo y prioridad.</div></div></div>
+            <div class="guide-step"><div class="gsn">💡</div><div><div class="gs-title">Decisión</div><div class="gs-desc"><em>"Decidí usar Mongo sobre Postgres porque el esquema es flexible"</em> → registra un log de Decisión con el texto completo y literal.</div></div></div>
+            <div class="guide-step"><div class="gsn">📓</div><div><div class="gs-title">Bitácora del día</div><div class="gs-desc"><em>"Hoy avancé en X, me trabé con Y, aprendí Z"</em> → te propone marcar tareas y crear logs; confirma antes de escribir.</div></div></div>
+          </div>
+          <div class="guide-tip"><strong>Tip:</strong> No hay que recordar comandos: hablá natural. AETHY reconoce estos patrones por intención y siempre responde con la misma estructura.</div>
         </div>
 
         <!-- DEV card -->
