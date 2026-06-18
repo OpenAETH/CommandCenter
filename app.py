@@ -706,6 +706,33 @@ _KW_LOG    = ("decid", "aprend", "insight", "riesgo", "oportunidad", "objetivo",
               "nota estrategica", "elegi", "elegí", "descart", "vamos con")
 
 
+def _last_user(messages) -> str:
+    """Texto del último mensaje del usuario (vacío si no hay)."""
+    for m in reversed(messages):
+        if m.get("role") == "user" and m.get("content"):
+            return m["content"]
+    return ""
+
+
+# Señales de que el último mensaje es una ORDEN AUTÓNOMA: trae todo lo necesario para ejecutar
+# la acción (un log con sus campos, un volcado de tareas) y NO depende del historial. En estos
+# casos mandamos sólo ese mensaje: el historial es puro overhead que dispara el 413 de TPM.
+_KW_SELFCONTAINED = ("tipo:", "titulo:", "título:", "descripcion:", "descripción:",
+                     "conexiones:", "volca:", "volcá:", "anota:", "anotá:", "registra:",
+                     "registrá:", "log tipo", "nuevo log")
+
+
+def _is_self_contained(messages) -> bool:
+    """True si el último mensaje del usuario es una orden completa que se ejecuta tal cual, sin
+    necesitar la conversación previa (p.ej. un log con 'Tipo:/Título:/Descripción:/Conexiones:').
+    El usuario lo confirmó: el log debe registrarse literal, el historial sólo estorba y desborda
+    el TPM. Pedimos al menos 2 marcadores para no descartar historial por un 'tipo:' suelto."""
+    txt = unicodedata.normalize('NFKD', _last_user(messages)).encode('ascii', 'ignore').decode().lower()
+    hits = sum(1 for k in _KW_SELFCONTAINED
+               if unicodedata.normalize('NFKD', k).encode('ascii', 'ignore').decode().lower() in txt)
+    return hits >= 2
+
+
 def _select_tools(messages):
     """Devuelve el subconjunto de GROQ_TOOLS para el último mensaje del usuario.
     Las lecturas van SIEMPRE (baratas y seguras: evitan que el modelo alucine datos que no
@@ -1087,21 +1114,26 @@ def _is_413(e) -> bool:
     return "request too large" in str(e).lower() or "413" in str(e)[:8]
 
 
+def _toklen(s: str) -> int:
+    """Estimación de tokens de un string. Medimos sobre BYTES UTF-8, no chars: las flechas '→' y
+    los acentos de los logs son multibyte (2-3 bytes) y Groq los cuenta como ~1 token cada uno.
+    Contar chars//3 los subestimaba y por eso pasaban requests que igual reventaban en 413."""
+    return len((s or "").encode('utf-8')) // 3
+
+
 def _estimate_tokens(messages, tools=None) -> int:
     """Estimación barata de tokens del request (no tokeniza igual que Groq, pero alcanza para
-    decidir cuánto recortar). ~3.1 chars/token para español + un overhead fijo por mensaje y por
-    tool. Tiramos a sobreestimar: preferimos recortar de más a comer un 413."""
+    decidir cuánto recortar). Tiramos a SOBREESTIMAR: preferimos recortar de más a comer un 413."""
     total = 8  # overhead base del request
     for m in messages:
         total += 4  # role + framing por mensaje
-        content = m.get("content") or ""
-        total += len(content) // 3
+        total += _toklen(m.get("content") or "")
         for tc in m.get("tool_calls") or []:
             fn = tc.get("function", {})
-            total += (len(fn.get("name", "")) + len(fn.get("arguments", ""))) // 3 + 8
+            total += _toklen(fn.get("name", "")) + _toklen(fn.get("arguments", "")) + 8
     for t in (tools or []):
         # El schema de cada tool va serializado en el request; lo medimos sobre su JSON.
-        total += len(json.dumps(t, ensure_ascii=False)) // 3
+        total += _toklen(json.dumps(t, ensure_ascii=False))
     return total
 
 
@@ -1282,10 +1314,14 @@ def chat():
     # el límite de TPM de Groq. None = mensaje conversacional, no mandamos tools.
     active_tools = _select_tools(messages)
 
-    # Recorte preventivo del lado servidor: tiramos los turnos más viejos del historial hasta que
-    # (entrada estimada + max_tokens) entre bajo el techo de TPM. Esto es lo que evita el 413
-    # intermitente: en turnos con logs largos el historial de 8 turnos inflaba el request por
-    # encima de 6000. Conserva siempre el system y el último mensaje del usuario.
+    # Órdenes autónomas (un log con sus campos, un volcado): el mensaje trae TODO lo necesario y
+    # debe registrarse literal. El historial no aporta y es justo lo que desbordaba el TPM (el
+    # usuario confirmó que al vaciar el chat dejaba de fallar). Para estas mandamos sólo el último
+    # mensaje del usuario; para el resto, recorte preventivo de los turnos más viejos hasta entrar.
+    if _is_self_contained(messages):
+        last = _last_user(messages)
+        history = [{"role": "user", "content": last}] if last else []
+
     all_messages, _dropped = _fit_messages(system_msg, history, active_tools, GROQ_MAX_TOKENS)
 
     for step in range(8):
