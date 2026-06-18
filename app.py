@@ -33,6 +33,16 @@ GROQ_MAX_RETRIES = int(os.environ.get('GROQ_MAX_RETRIES', '3'))
 # Pausa (ms) entre pasos del loop de tools, para no acumular requests dentro de la misma
 # ventana de TPM (rate-limit por minuto). El Sync 1×1 ejecuta una tool por paso y espera esto.
 GROQ_THROTTLE_MS = int(os.environ.get('GROQ_THROTTLE_MS', '350'))
+# Techo de TPM del tier de Groq. Groq cuenta input+max_tokens contra este límite por minuto;
+# si la suma lo supera devuelve 413 'request too large' (NO es truncamiento). Recortamos el
+# request del lado servidor para que SIEMPRE entre, en vez de propagar el 413 al usuario.
+GROQ_TPM_LIMIT = int(os.environ.get('GROQ_TPM_LIMIT', '6000'))
+# Colchón de seguridad: nuestra cuenta de tokens es una estimación (no tokeniza igual que Groq),
+# así que dejamos margen para no rozar el techo por un error de redondeo.
+GROQ_TPM_MARGIN = int(os.environ.get('GROQ_TPM_MARGIN', '600'))
+# Piso de max_tokens: aunque haya que achicar el budget de salida para que entre el request,
+# nunca bajamos de acá (debajo de esto Qwen3 trunca el JSON de tools, ver memoria del bug).
+GROQ_MIN_TOKENS = int(os.environ.get('GROQ_MIN_TOKENS', '1024'))
 
 client = MongoClient(
     MONGODB_URI,
@@ -1067,6 +1077,59 @@ def _is_transient_groq_error(e) -> bool:
     return status == 429 or 500 <= status < 600
 
 
+def _is_413(e) -> bool:
+    """True si el error de Groq es 413 'request too large' (TPM excedido). Lo distinguimos del
+    429 porque el 413 NO se arregla esperando: hay que achicar el request y reintentar."""
+    status = getattr(e, "status_code", None) or getattr(e, "status", None)
+    if status == 413:
+        return True
+    # Algunos SDK no exponen status; caemos al texto del error.
+    return "request too large" in str(e).lower() or "413" in str(e)[:8]
+
+
+def _estimate_tokens(messages, tools=None) -> int:
+    """Estimación barata de tokens del request (no tokeniza igual que Groq, pero alcanza para
+    decidir cuánto recortar). ~3.1 chars/token para español + un overhead fijo por mensaje y por
+    tool. Tiramos a sobreestimar: preferimos recortar de más a comer un 413."""
+    total = 8  # overhead base del request
+    for m in messages:
+        total += 4  # role + framing por mensaje
+        content = m.get("content") or ""
+        total += len(content) // 3
+        for tc in m.get("tool_calls") or []:
+            fn = tc.get("function", {})
+            total += (len(fn.get("name", "")) + len(fn.get("arguments", ""))) // 3 + 8
+    for t in (tools or []):
+        # El schema de cada tool va serializado en el request; lo medimos sobre su JSON.
+        total += len(json.dumps(t, ensure_ascii=False)) // 3
+    return total
+
+
+def _fit_messages(system_msg, history, tools, max_tokens):
+    """Recorta los turnos más viejos del historial hasta que (estimado de entrada + max_tokens)
+    entre bajo el techo de TPM con margen. SIEMPRE conserva el system prompt y el último mensaje
+    del usuario (sin ellos no hay nada que responder). Devuelve (lista_de_mensajes, dropped)."""
+    budget = GROQ_TPM_LIMIT - GROQ_TPM_MARGIN - max_tokens
+    # Conservamos el system y el último user pase lo que pase; recortamos del medio hacia atrás.
+    last_user_idx = next((i for i in range(len(history) - 1, -1, -1)
+                          if history[i].get("role") == "user"), None)
+    dropped = 0
+    while True:
+        msgs = [system_msg] + history
+        if _estimate_tokens(msgs, tools) <= budget:
+            return msgs, dropped
+        # Buscar el turno más viejo que se pueda tirar (no el último user, no el system).
+        drop_at = next((i for i in range(len(history))
+                        if i != last_user_idx), None)
+        if drop_at is None:
+            # Ya no queda nada que recortar salvo system + último user: devolvemos lo mínimo.
+            return [system_msg] + ([history[last_user_idx]] if last_user_idx is not None else []), dropped
+        history = history[:drop_at] + history[drop_at + 1:]
+        if last_user_idx is not None and drop_at < last_user_idx:
+            last_user_idx -= 1
+        dropped += 1
+
+
 def _groq_retry_after(e):
     """Segundos a esperar según el header 'retry-after' del 429, si viene. None si no."""
     resp = getattr(e, "response", None)
@@ -1207,7 +1270,7 @@ def chat():
 
     # Rebuild conversation history — include tool messages from this request only
     # (client sends only user/assistant content turns)
-    all_messages = [system_msg] + [
+    history = [
         {"role": m["role"], "content": m["content"]}
         for m in messages
         if m.get("role") in ("user", "assistant") and m.get("content")
@@ -1219,21 +1282,51 @@ def chat():
     # el límite de TPM de Groq. None = mensaje conversacional, no mandamos tools.
     active_tools = _select_tools(messages)
 
+    # Recorte preventivo del lado servidor: tiramos los turnos más viejos del historial hasta que
+    # (entrada estimada + max_tokens) entre bajo el techo de TPM. Esto es lo que evita el 413
+    # intermitente: en turnos con logs largos el historial de 8 turnos inflaba el request por
+    # encima de 6000. Conserva siempre el system y el último mensaje del usuario.
+    all_messages, _dropped = _fit_messages(system_msg, history, active_tools, GROQ_MAX_TOKENS)
+
     for step in range(8):
         # Pacing entre pasos del Sync 1×1: separa los requests dentro de la ventana de TPM.
         if step > 0 and GROQ_THROTTLE_MS > 0:
             time.sleep(GROQ_THROTTLE_MS / 1000.0)
+
+        # Budget de salida adaptado a lo que ya ocupa la entrada: a medida que se acumulan
+        # resultados de tools el input crece, así que bajamos max_tokens (sin pasar del piso)
+        # para que input+max_tokens siga entrando bajo el techo de TPM y no dispare un 413.
+        in_est = _estimate_tokens(all_messages, active_tools)
+        step_max = max(GROQ_MIN_TOKENS,
+                       min(GROQ_MAX_TOKENS, GROQ_TPM_LIMIT - GROQ_TPM_MARGIN - in_est))
+
         try:
-            create_kwargs = dict(
-                model=GROQ_MODEL,
-                messages=all_messages,
-                max_tokens=GROQ_MAX_TOKENS,
-                reasoning_format="hidden",
-            )
-            if active_tools:
-                create_kwargs["tools"] = active_tools
-                create_kwargs["tool_choice"] = "auto"
-            response = _groq_create(**create_kwargs)
+            response = None
+            # Reintento defensivo ante 413: si pese al recorte previo Groq todavía considera el
+            # request demasiado grande, achicamos (más historial fuera + menos max_tokens) y
+            # reintentamos en vez de devolverle el error crudo al usuario.
+            for shrink in range(3):
+                create_kwargs = dict(
+                    model=GROQ_MODEL,
+                    messages=all_messages,
+                    max_tokens=step_max,
+                    reasoning_format="hidden",
+                )
+                if active_tools:
+                    create_kwargs["tools"] = active_tools
+                    create_kwargs["tool_choice"] = "auto"
+                try:
+                    response = _groq_create(**create_kwargs)
+                    break
+                except Exception as e:
+                    if not _is_413(e) or shrink == 2:
+                        raise
+                    # Achicamos para el próximo intento: primero soltamos más historial, y si
+                    # ya no hay historial que soltar, recortamos el budget de salida.
+                    all_messages, _d = _fit_messages(
+                        system_msg, all_messages[1:], active_tools,
+                        step_max + max(400, step_max // 3))
+                    step_max = max(GROQ_MIN_TOKENS, step_max - max(400, step_max // 3))
         except Exception as e:
             return jsonify({'response': f'Error Groq: {str(e)}', 'refresh': did_tool_calls})
 
