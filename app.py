@@ -11,6 +11,11 @@ try:
 except ImportError:
     GroqClient = None
 
+try:
+    from headroom import compress as hr_compress
+except ImportError:
+    hr_compress = None
+
 app = Flask(__name__)
 CORS(app)
 
@@ -43,6 +48,16 @@ GROQ_TPM_MARGIN = int(os.environ.get('GROQ_TPM_MARGIN', '600'))
 # Piso de max_tokens: aunque haya que achicar el budget de salida para que entre el request,
 # nunca bajamos de acá (debajo de esto Qwen3 trunca el JSON de tools, ver memoria del bug).
 GROQ_MIN_TOKENS = int(os.environ.get('GROQ_MIN_TOKENS', '1024'))
+# Compresión de contexto (Headroom) antes de cada llamada a Groq: achica los tool outputs / JSON
+# de Mongo que se reinyectan al modelo en cada paso del loop. Se desactiva sola si headroom-ai no
+# está instalado; HEADROOM_DISABLE=1 la apaga sin redeploy.
+HEADROOM_ENABLED = bool(hr_compress) and os.environ.get('HEADROOM_DISABLE') != '1'
+# Modelo SOLO para el conteo interno de tokens de Headroom — NO es el modelo que responde (ese es
+# GROQ_MODEL). 'gpt-4o' usa tiktoken (ya viene con headroom-ai); un nombre 'qwen/...' enrutaría al
+# tokenizer HuggingFace, que exige el paquete `transformers` (~2GB) y, si falta, deja la compresión
+# en no-op silencioso. El conteo queda aproximado para Qwen, pero eso solo afecta decisiones
+# internas de Headroom: el gating real de TPM lo sigue haciendo _fit_messages/_estimate_tokens.
+HEADROOM_TOKENIZER_MODEL = os.environ.get('HEADROOM_TOKENIZER_MODEL', 'gpt-4o')
 
 client = MongoClient(
     MONGODB_URI,
@@ -105,6 +120,7 @@ def health():
             'status': 'ok', 'db': 'connected',
             'mongo_db': MONGODB_DB,
             'groq': bool(groq_client),
+            'headroom': HEADROOM_ENABLED,
             'timestamp': datetime.now().isoformat()
         })
     except Exception as e:
@@ -1177,6 +1193,25 @@ def _groq_create(**kwargs):
     """Llama a Groq con backoff exponencial + jitter ante fallos transitorios.
     Reintenta hasta GROQ_MAX_RETRIES; re-lanza de inmediato los errores no transitorios.
     En rate-limit (429) respeta el header 'retry-after' de Groq si está presente."""
+
+    # Compresión de contexto justo antes de pegarle a Groq. El try/except es a propósito: si la
+    # compresión falla por cualquier motivo, seguimos con los mensajes sin comprimir en vez de
+    # romper el chat. NUNCA debe ser un punto de falla del chatbot.
+    if HEADROOM_ENABLED and kwargs.get('messages'):
+        try:
+            result = hr_compress(
+                kwargs['messages'],
+                model=HEADROOM_TOKENIZER_MODEL,  # solo para contar tokens; el LLM real es GROQ_MODEL
+                model_limit=131072,              # ventana de contexto de qwen3-32b en Groq
+                compress_user_messages=False,    # no tocar lo que escribe el usuario, solo tool outputs
+            )
+            kwargs['messages'] = result.messages
+            if result.tokens_saved > 0:
+                print(f"[headroom] {result.tokens_saved} tokens ahorrados "
+                      f"({result.compression_ratio:.0%}) — {result.transforms_applied}")
+        except Exception as e:
+            print(f"[headroom] compresión falló, sigo sin comprimir: {e}")
+
     last_exc = None
     for attempt in range(GROQ_MAX_RETRIES + 1):
         try:
