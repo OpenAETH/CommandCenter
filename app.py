@@ -68,7 +68,12 @@ client = MongoClient(
 )
 db = client[MONGODB_DB]
 
-groq_client = GroqClient(api_key=GROQ_API_KEY) if (GroqClient and GROQ_API_KEY) else None
+# max_retries=0: desactivamos el retry INTERNO del SDK de Groq. Por default reintenta 2 veces y,
+# ante un 429 (TPM), DUERME el 'retry-after' completo (puede ser 30-60s) dentro de create() —ese
+# sleep largo choca con el --timeout de gunicorn y mata al worker (SIGKILL) antes de que nuestro
+# propio backoff capeado en _groq_create llegue a correr. Manejamos los reintentos nosotros.
+groq_client = (GroqClient(api_key=GROQ_API_KEY, max_retries=0)
+               if (GroqClient and GROQ_API_KEY) else None)
 
 # ============================================================================
 # HELPERS
