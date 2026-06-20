@@ -5,8 +5,10 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
     envVars:
+      # headroom-ai depende de litellm>=1.86.2,<2.0, que solo soporta Python <3.14.
+      # Render por defecto agarra 3.14, así que fijamos 3.13 (ver también .python-version).
       - key: PYTHON_VERSION
-        value: 3.11.0
+        value: 3.13.12
       - key: MONGODB_URI
         sync: false
       - key: MONGODB_DB
