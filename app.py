@@ -1391,6 +1391,9 @@ def chat():
                 if active_tools:
                     create_kwargs["tools"] = active_tools
                     create_kwargs["tool_choice"] = "auto"
+                    # Una sola tool por respuesta, forzado por la API (no depende de que el
+                    # modelo respete la regla 8). No cuesta tokens de prompt.
+                    create_kwargs["parallel_tool_calls"] = False
                 try:
                     response = _groq_create(**create_kwargs)
                     break
@@ -1404,11 +1407,26 @@ def chat():
                         step_max + max(400, step_max // 3))
                     step_max = max(GROQ_MIN_TOKENS, step_max - max(400, step_max // 3))
         except Exception as e:
+            if did_tool_calls:
+                # La(s) tool(s) de este turno ya se ejecutaron con éxito; el error es sólo del
+                # paso de redactar la confirmación. No es justo mostrarle "Error" al usuario por
+                # algo que sí se guardó.
+                return jsonify({
+                    'response': '✅ Listo, se guardó. (No pude redactar la confirmación por '
+                                'límite de uso de Groq — si no ves el cambio reflejado, '
+                                'refrescá la página.)',
+                    'refresh': True
+                })
             return jsonify({'response': f'Error Groq: {str(e)}', 'refresh': did_tool_calls})
 
         choice = response.choices[0]
         message = choice.message
         finish_reason = choice.finish_reason
+
+        # Defensa por si el modelo igual manda dos tools (no debería con parallel_tool_calls=False):
+        # nos quedamos con la primera para sostener el Sync 1×1.
+        if message.tool_calls and len(message.tool_calls) > 1:
+            message.tool_calls = message.tool_calls[:1]
 
         # Append assistant message (with tool_calls if present)
         asst_msg = {"role": "assistant", "content": strip_think(message.content) or ""}
@@ -1422,6 +1440,7 @@ def chat():
 
         if finish_reason == "tool_calls" and message.tool_calls:
             did_tool_calls = True
+            tool_results = []
             for tc in message.tool_calls:
                 try:
                     tool_args = json.loads(tc.function.arguments)
@@ -1439,10 +1458,23 @@ def chat():
                     continue
                 result = execute_tool(tc.function.name, tool_args)
                 _log_tool_call(tc.function.name, tool_args, result, finish_reason)
+                tool_results.append((tc.function.name, result))
                 all_messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
                     "content": json.dumps(result, ensure_ascii=False, default=str)
+                })
+
+            # Atajo determinístico: create_log solo y sin error → confirmamos en Python y NO
+            # volvemos a llamar a Groq. Elimina la segunda llamada que causaba el bug reportado
+            # (el log se guardaba pero el paso de wrap-up chocaba con el TPM y mostraba "Error").
+            if (len(tool_results) == 1 and tool_results[0][0] == "create_log"
+                    and "error" not in tool_results[0][1]):
+                r = tool_results[0][1]
+                titulo = f": «{r['title']}»" if r.get("title") else "."
+                return jsonify({
+                    "response": f"✅ Log de tipo **{r.get('type', '')}** guardado{titulo}",
+                    "refresh": True
                 })
         elif finish_reason == "length":
             # La respuesta se cortó por límite de tokens (no por terminar). Avisamos en vez de
