@@ -16,6 +16,11 @@ try:
 except ImportError:
     hr_compress = None
 
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
 app = Flask(__name__)
 CORS(app)
 
@@ -26,8 +31,9 @@ CORS(app)
 MONGODB_URI = os.environ.get('MONGODB_URI', '')
 MONGODB_DB  = os.environ.get('MONGODB_DB', 'commandcenter')
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
-# Modelo Groq (env var para poder cambiarlo sin redeploy; Qwen3-32B está en preview).
-GROQ_MODEL = os.environ.get('GROQ_MODEL', 'qwen/qwen3-32b')
+# Modelo Groq (env var para poder cambiarlo sin redeploy). qwen/qwen3-32b fue deprecado por Groq
+# (jun-2026); qwen/qwen3.6-27b es el reemplazo recomendado y, como 32B, es un modelo reasoning.
+GROQ_MODEL = os.environ.get('GROQ_MODEL', 'qwen/qwen3.6-27b')
 # Presupuesto de salida. Qwen3 es reasoning: el razonamiento consume este budget junto con
 # el JSON de tool_calls. OJO: Groq cuenta input+max_tokens contra el límite de TPM (6000 en
 # el tier gratis), así que un max_tokens alto solo dispara 413 'request too large'. Con tools
@@ -425,6 +431,150 @@ def get_stats():
             'products_total':  db.products.count_documents({}),
             'products_active': db.products.count_documents({'status': 'activo'}),
         })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ============================================================================
+# IMPORT / EXPORT YAML
+# ─────────────────────────────────────────────────────────────────────────────
+# Snapshot legible (humano + IA) de productos con sus tareas anidadas, para
+# compartir/respaldar un proyecto. Los strategy_logs NO se incluyen: son globales
+# (no tienen product_id), así que no pertenecen a un export por-proyecto.
+# El import es REPLACE TOTAL: valida el YAML ANTES de borrar nada, y recién
+# entonces reemplaza products+tasks. Los logs nunca se tocan.
+# ============================================================================
+
+# Valores permitidos (espejo de create_task/create_product) para normalizar al importar.
+_TASK_STATUS   = ('todo', 'doing', 'done')
+_TASK_PRIORITY = ('bajo', 'medio', 'alto')
+_TASK_IMPACT   = ('bajo', 'medio', 'alto')
+
+def _slug(s):
+    """Nombre de archivo seguro a partir de un texto (sin acentos, solo alfanum y guiones)."""
+    s = unicodedata.normalize('NFKD', s or '').encode('ascii', 'ignore').decode('ascii')
+    s = re.sub(r'[^a-zA-Z0-9]+', '-', s).strip('-').lower()
+    return s or 'export'
+
+def _product_to_dict(p):
+    """Producto Mongo → dict de export (sin _id ni timestamps ni sort_order)."""
+    tasks = []
+    for t in db.tasks.find({'product_id': str(p['_id'])}).sort([('module', 1), ('_id', 1)]):
+        tasks.append({
+            'module':      t.get('module', 'Backend'),
+            'name':        t.get('name', ''),
+            'description': t.get('description', ''),
+            'status':      t.get('status', 'todo'),
+            'priority':    t.get('priority', 'medio'),
+            'impact':      t.get('impact', 'medio'),
+        })
+    return {
+        'name':        p.get('name', ''),
+        'icon':        p.get('icon', '📦'),
+        'description': p.get('description', ''),
+        'status':      p.get('status', 'activo'),
+        'color':       p.get('color', '#00e5ff'),
+        'tasks':       tasks,
+    }
+
+@app.route('/api/export', methods=['GET'])
+def export_yaml():
+    if yaml is None:
+        return jsonify({'error': 'PyYAML no está instalado en el servidor'}), 500
+    try:
+        pid = request.args.get('product_id')
+        if pid:
+            p = db.products.find_one({'_id': oid(pid)})
+            if not p:
+                return jsonify({'error': 'Producto no encontrado'}), 404
+            products = [p]
+            scope = p.get('name', 'proyecto')
+        else:
+            products = list(db.products.find().sort([('sort_order', 1), ('_id', 1)]))
+            scope = 'TODOS'
+        payload = {
+            'command_center_export': 1,
+            'exported_at': datetime.utcnow().isoformat(),
+            'scope': scope,
+            'products': [_product_to_dict(p) for p in products],
+        }
+        body = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False)
+        filename = 'commandcenter-%s.yaml' % _slug(scope)
+        return body, 200, {
+            'Content-Type': 'application/x-yaml; charset=utf-8',
+            'Content-Disposition': 'attachment; filename="%s"' % filename,
+        }
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/import', methods=['POST'])
+def import_yaml():
+    if yaml is None:
+        return jsonify({'error': 'PyYAML no está instalado en el servidor'}), 500
+    # Aceptamos YAML crudo (text/yaml) o JSON {"yaml": "..."}.
+    raw = None
+    if request.is_json:
+        raw = (request.json or {}).get('yaml')
+    if raw is None:
+        raw = request.get_data(as_text=True)
+    if not raw or not raw.strip():
+        return jsonify({'error': 'El archivo está vacío'}), 400
+
+    # ── VALIDACIÓN (antes de tocar la base) ──────────────────────────────────
+    try:
+        data = yaml.safe_load(raw)
+    except Exception as e:
+        return jsonify({'error': 'YAML inválido: %s' % e}), 400
+    if not isinstance(data, dict):
+        return jsonify({'error': 'Formato inesperado: se esperaba un mapa en la raíz'}), 400
+    if 'command_center_export' not in data:
+        return jsonify({'error': 'No es un export de Command Center (falta command_center_export)'}), 400
+    products = data.get('products')
+    if not isinstance(products, list):
+        return jsonify({'error': "El campo 'products' debe ser una lista"}), 400
+    for p in products:
+        if not isinstance(p, dict) or not (p.get('name') or '').strip():
+            return jsonify({'error': 'Cada producto debe ser un mapa con un name'}), 400
+        tk = p.get('tasks', [])
+        if tk is not None and not isinstance(tk, list):
+            return jsonify({'error': "El campo 'tasks' de cada producto debe ser una lista"}), 400
+
+    # ── REPLACE TOTAL (recién acá, ya validado) ─────────────────────────────
+    try:
+        now = datetime.utcnow()
+        db.tasks.delete_many({})
+        db.products.delete_many({})
+        n_products = n_tasks = 0
+        for i, p in enumerate(products, start=1):
+            product = {
+                'name': str(p.get('name', '')).strip(),
+                'icon': p.get('icon') or '📦',
+                'description': p.get('description') or '',
+                'status': p.get('status') or 'activo',
+                'color': p.get('color') or '#00e5ff',
+                'sort_order': i,
+                'created_at': now, 'updated_at': now,
+            }
+            res = db.products.insert_one(product)
+            n_products += 1
+            pid = str(res.inserted_id)
+            for t in (p.get('tasks') or []):
+                if not isinstance(t, dict):
+                    continue
+                status   = t.get('status')   if t.get('status')   in _TASK_STATUS   else 'todo'
+                priority = t.get('priority') if t.get('priority') in _TASK_PRIORITY else 'medio'
+                impact   = t.get('impact')   if t.get('impact')   in _TASK_IMPACT   else 'medio'
+                task = {
+                    'product_id': pid,
+                    'module': t.get('module') or 'Backend',
+                    'name': str(t.get('name', '')).strip(),
+                    'description': t.get('description') or '',
+                    'status': status, 'priority': priority, 'impact': impact,
+                    'created_at': now, 'updated_at': now,
+                }
+                apply_completion(task, status, now)
+                db.tasks.insert_one(task)
+                n_tasks += 1
+        return jsonify({'ok': True, 'products_imported': n_products, 'tasks_imported': n_tasks})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1207,7 +1357,7 @@ def _groq_create(**kwargs):
             result = hr_compress(
                 kwargs['messages'],
                 model=HEADROOM_TOKENIZER_MODEL,  # solo para contar tokens; el LLM real es GROQ_MODEL
-                model_limit=131072,              # ventana de contexto de qwen3-32b en Groq
+                model_limit=131072,              # ventana de contexto de qwen3.6-27b en Groq
                 compress_user_messages=False,    # no tocar lo que escribe el usuario, solo tool outputs
             )
             kwargs['messages'] = result.messages
@@ -2163,6 +2313,8 @@ input,select,textarea{font-family:inherit;}
       <div class="panel-actions">
         <button class="btn btn-sm" onclick="expandAllProducts()">Expandir todo</button>
         <button class="btn btn-sm" onclick="collapseAllProducts()">Colapsar todo</button>
+        <button class="btn btn-sm" onclick="openExportModal()" title="Exportar a YAML">⬇ Exportar</button>
+        <button class="btn btn-sm" onclick="openImportModal()" title="Importar desde YAML">⬆ Importar</button>
         <button class="btn btn-sm" onclick="openProductModal()">+ Producto</button>
         <button class="btn btn-sm btn-primary" onclick="openTaskModal()">+ Task</button>
       </div>
@@ -2263,7 +2415,7 @@ input,select,textarea{font-family:inherit;}
         <div class="guide-card">
           <div class="guide-card-head">
             <div class="guide-card-icon">🤖</div>
-            <div><div class="guide-card-title" style="color:var(--purple-light)">AETHY</div><div class="guide-card-sub">Asistente IA · Qwen3-32B · gestión por chat</div></div>
+            <div><div class="guide-card-title" style="color:var(--purple-light)">AETHY</div><div class="guide-card-sub">Asistente IA · Qwen3.6-27B · gestión por chat</div></div>
           </div>
           <div class="guide-steps">
             <div class="guide-step"><div class="gsn hl">1</div><div><div class="gs-title">Crear</div><div class="gs-desc"><em>"Cargá el producto X con las tareas A, B, C"</em> — producto + tareas en una sola operación.</div></div></div>
@@ -2493,6 +2645,40 @@ input,select,textarea{font-family:inherit;}
     <div class="modal-foot">
       <span></span>
       <div style="display:flex;gap:7px"><button class="btn" onclick="closeModal('modal-log')">Cancelar</button><button class="btn btn-primary" id="log-save-btn" onclick="saveLog()">Registrar</button></div>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL EXPORTAR -->
+<div class="overlay" id="modal-export" onclick="overlayClose(event,'modal-export')">
+  <div class="modal">
+    <div class="modal-head"><div class="modal-title">⬇ Exportar a YAML</div><button class="modal-close" onclick="closeModal('modal-export')">✕</button></div>
+    <div class="modal-body">
+      <div class="f-group"><label class="f-label">Proyecto</label>
+        <select class="f-select" id="export-product"></select>
+      </div>
+      <div class="f-hint" style="margin-top:6px">Se exporta el producto con sus tareas anidadas. Los Logs de estrategia son globales y no se incluyen.</div>
+    </div>
+    <div class="modal-foot">
+      <span></span>
+      <div style="display:flex;gap:7px"><button class="btn" onclick="closeModal('modal-export')">Cancelar</button><button class="btn btn-primary" onclick="doExport()">Descargar .yaml</button></div>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL IMPORTAR -->
+<div class="overlay" id="modal-import" onclick="overlayClose(event,'modal-import')">
+  <div class="modal">
+    <div class="modal-head"><div class="modal-title">⬆ Importar desde YAML</div><button class="modal-close" onclick="closeModal('modal-import')">✕</button></div>
+    <div class="modal-body">
+      <div class="f-group"><label class="f-label">Archivo .yaml</label>
+        <input class="f-input" type="file" id="import-file" accept=".yaml,.yml,text/yaml"/>
+      </div>
+      <div class="f-hint" style="margin-top:8px;color:var(--red)">⚠️ Reemplaza TODOS los productos y tareas actuales por el contenido del archivo. Los Logs de estrategia no se tocan. Esta acción no se puede deshacer.</div>
+    </div>
+    <div class="modal-foot">
+      <span></span>
+      <div style="display:flex;gap:7px"><button class="btn" onclick="closeModal('modal-import')">Cancelar</button><button class="btn btn-danger" onclick="doImport()">Reemplazar e importar</button></div>
     </div>
   </div>
 </div>
@@ -2986,6 +3172,56 @@ function resolveConfirm(val){
   closeModal('modal-confirm');
   if(_confirmResolve){_confirmResolve(val);_confirmResolve=null;}
 }
+
+// ── Import / Export YAML ────────────────────────────────────────────────────
+function openExportModal(){
+  const sel=document.getElementById('export-product');
+  let opts='<option value="">📦 Todos los proyectos</option>';
+  for(const p of STATE.products){
+    opts+=`<option value="${p.id}">${p.icon||'📦'} ${p.name}</option>`;
+  }
+  sel.innerHTML=opts;
+  openModal('modal-export');
+}
+function doExport(){
+  const pid=document.getElementById('export-product').value;
+  // Descarga directa vía <a download>: el endpoint devuelve YAML, no JSON, así que
+  // no pasa por el helper api(). El Content-Disposition del server fija el filename.
+  const a=document.createElement('a');
+  a.href=API+'/api/export'+(pid?('?product_id='+encodeURIComponent(pid)):'');
+  a.download='';
+  document.body.appendChild(a);a.click();a.remove();
+  closeModal('modal-export');
+}
+function openImportModal(){
+  document.getElementById('import-file').value='';
+  openModal('modal-import');
+}
+async function doImport(){
+  const inp=document.getElementById('import-file');
+  const file=inp.files&&inp.files[0];
+  if(!file){shake('import-file');return;}
+  let text;
+  try{text=await file.text();}
+  catch(e){alert('No se pudo leer el archivo: '+e.message);return;}
+  closeModal('modal-import');
+  const ok=await confirmDialog({
+    title:'Reemplazar todo',
+    message:'Se borrarán TODOS los productos y tareas actuales y se cargará el contenido del archivo. Los Logs no se tocan. ¿Continuar?',
+    okText:'Reemplazar'});
+  if(!ok)return;
+  try{
+    const r=await fetch(API+'/api/import',{method:'POST',
+      headers:{'Content-Type':'application/x-yaml'},body:text});
+    if(!r.ok){let m='Error '+r.status;try{m=await r.text();}catch(e){}throw new Error(m);}
+    const res=await r.json();
+    await boot();
+    alert(`Importado: ${res.products_imported} producto(s), ${res.tasks_imported} tarea(s).`);
+  }catch(e){
+    alert('Error al importar: '+e.message);
+  }
+}
+
 function v(id){return document.getElementById(id).value;}
 function shake(id){
   const el=document.getElementById(id);if(!el)return;
@@ -3138,7 +3374,7 @@ boot();
     <div class="chat-head-icon">🤖</div>
     <div class="chat-head-info">
       <div class="chat-head-title">AETHY</div>
-      <div class="chat-head-sub">Asistente IA · Qwen3-32B</div>
+      <div class="chat-head-sub">Asistente IA · Qwen3.6-27B</div>
     </div>
     <div class="chat-online"></div>
     <button class="chat-clear" onclick="clearChat()" title="Limpiar historial">🗑</button>
