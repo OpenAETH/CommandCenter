@@ -2801,6 +2801,23 @@ input,select,textarea{font-family:inherit;}
   </div>
 </div>
 
+<!-- MODAL IMPORTAR LOGS -->
+<div class="overlay" id="modal-import-logs" onclick="overlayClose(event,'modal-import-logs')">
+  <div class="modal">
+    <div class="modal-head"><div class="modal-title">⬆ Importar Logs desde YAML</div><button class="modal-close" onclick="closeModal('modal-import-logs')">✕</button></div>
+    <div class="modal-body">
+      <div class="f-group"><label class="f-label">Archivo .yaml</label>
+        <input class="f-input" type="file" id="import-logs-file" accept=".yaml,.yml,text/yaml"/>
+      </div>
+      <div class="f-hint" style="margin-top:8px">Los logs se importan por merge idempotente: si ya existe un log idéntico (mismo tipo, título, fecha y texto) se omite. No se borran logs existentes.</div>
+    </div>
+    <div class="modal-foot">
+      <span></span>
+      <div style="display:flex;gap:7px"><button class="btn" onclick="closeModal('modal-import-logs')">Cancelar</button><button class="btn btn-primary" onclick="doImportLogs()">Importar</button></div>
+    </div>
+  </div>
+</div>
+
 <!-- MODAL CONFIRM -->
 <div class="overlay" id="modal-confirm" onclick="overlayClose(event,'modal-confirm')">
   <div class="modal modal-confirm">
@@ -3311,6 +3328,16 @@ function doExport(){
   document.body.appendChild(a);a.click();a.remove();
   closeModal('modal-export');
 }
+function doExportLogs(){
+  const a=document.createElement('a');
+  a.href=API+'/api/export-logs';
+  a.download='';
+  document.body.appendChild(a);a.click();a.remove();
+}
+function openImportLogsModal(){
+  document.getElementById('import-logs-file').value='';
+  openModal('modal-import-logs');
+}
 function openImportModal(){
   document.getElementById('import-file').value='';
   openModal('modal-import');
@@ -3334,9 +3361,30 @@ async function doImport(){
     if(!r.ok){let m='Error '+r.status;try{m=await r.text();}catch(e){}throw new Error(m);}
     const res=await r.json();
     await boot();
-    alert(`Importado: ${res.products_imported} producto(s), ${res.tasks_imported} tarea(s).`);
+    const pTotal=(res.products_created||0)+(res.products_merged||0);
+    const tTotal=(res.tasks_created||0)+(res.tasks_updated||0);
+    alert(`Importados: ${pTotal} producto(s), ${tTotal} tarea(s).`);
   }catch(e){
     alert('Error al importar: '+e.message);
+  }
+}
+async function doImportLogs(){
+  const inp=document.getElementById('import-logs-file');
+  const file=inp.files&&inp.files[0];
+  if(!file){shake('import-logs-file');return;}
+  let text;
+  try{text=await file.text();}
+  catch(e){alert('No se pudo leer el archivo: '+e.message);return;}
+  closeModal('modal-import-logs');
+  try{
+    const r=await fetch(API+'/api/import-logs',{method:'POST',
+      headers:{'Content-Type':'application/x-yaml'},body:text});
+    if(!r.ok){let m='Error '+r.status;try{m=await r.text();}catch(e){}throw new Error(m);}
+    const res=await r.json();
+    await loadLogs();await loadStats();renderStrategy();renderStats();
+    toast(`Importados: ${res.logs_imported||0} log(s), omitidos: ${res.logs_skipped||0}`,'success');
+  }catch(e){
+    alert('Error al importar logs: '+e.message);
   }
 }
 
