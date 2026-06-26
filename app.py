@@ -438,10 +438,13 @@ def get_stats():
 # IMPORT / EXPORT YAML
 # ─────────────────────────────────────────────────────────────────────────────
 # Snapshot legible (humano + IA) de productos con sus tareas anidadas, para
-# compartir/respaldar un proyecto. Los strategy_logs NO se incluyen: son globales
-# (no tienen product_id), así que no pertenecen a un export por-proyecto.
-# El import es REPLACE TOTAL: valida el YAML ANTES de borrar nada, y recién
-# entonces reemplaza products+tasks. Los logs nunca se tocan.
+# compartir/respaldar un proyecto.
+# El import de productos es MERGE no destructivo: valida el YAML ANTES de tocar
+# la base y luego fusiona. Producto cuyo nombre ya existe → se le suman/actualizan
+# sus tareas (no se duplica el producto). Nunca borra nada.
+# Los strategy_logs tienen su propio par export/import (export-logs / import-logs),
+# también por merge idempotente; son globales (no tienen product_id), por eso van
+# en un flujo aparte y no en el export por-proyecto.
 # ============================================================================
 
 # Valores permitidos (espejo de create_task/create_product) para normalizar al importar.
@@ -506,6 +509,36 @@ def export_yaml():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+def _log_to_dict(l):
+    """Strategy log Mongo → dict de export (sin _id ni timestamps internos)."""
+    links = l.get('links')
+    return {
+        'type':  l.get('type', 'Insight'),
+        'title': l.get('title', ''),
+        'text':  l.get('text', ''),
+        'links': links if isinstance(links, list) else [],
+        'date':  l.get('date', ''),
+    }
+
+@app.route('/api/export-logs', methods=['GET'])
+def export_logs_yaml():
+    if yaml is None:
+        return jsonify({'error': 'PyYAML no está instalado en el servidor'}), 500
+    try:
+        logs = [_log_to_dict(l) for l in db.strategy_logs.find().sort('created_at', -1)]
+        payload = {
+            'command_center_logs_export': 1,
+            'exported_at': datetime.utcnow().isoformat(),
+            'logs': logs,
+        }
+        body = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False)
+        return body, 200, {
+            'Content-Type': 'application/x-yaml; charset=utf-8',
+            'Content-Disposition': 'attachment; filename="commandcenter-logs.yaml"',
+        }
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/import', methods=['POST'])
 def import_yaml():
     if yaml is None:
@@ -538,43 +571,126 @@ def import_yaml():
         if tk is not None and not isinstance(tk, list):
             return jsonify({'error': "El campo 'tasks' de cada producto debe ser una lista"}), 400
 
-    # ── REPLACE TOTAL (recién acá, ya validado) ─────────────────────────────
+    # ── MERGE no destructivo (recién acá, ya validado) ──────────────────────
+    # Producto: match exacto por nombre (case-insensitive, anclado ^...$) para no
+    # fusionar por coincidencia parcial. Si existe se reusa su _id; si no, se crea.
+    # Tarea: match por name+module dentro del producto resuelto → update; si no, insert.
     try:
         now = datetime.utcnow()
-        db.tasks.delete_many({})
-        db.products.delete_many({})
-        n_products = n_tasks = 0
-        for i, p in enumerate(products, start=1):
-            product = {
-                'name': str(p.get('name', '')).strip(),
-                'icon': p.get('icon') or '📦',
-                'description': p.get('description') or '',
-                'status': p.get('status') or 'activo',
-                'color': p.get('color') or '#00e5ff',
-                'sort_order': i,
-                'created_at': now, 'updated_at': now,
-            }
-            res = db.products.insert_one(product)
-            n_products += 1
-            pid = str(res.inserted_id)
+        products_created = products_merged = tasks_created = tasks_updated = 0
+        for p in products:
+            name = str(p.get('name', '')).strip()
+            existing = db.products.find_one(
+                {'name': {'$regex': '^%s$' % re.escape(name), '$options': 'i'}})
+            if existing:
+                pid = str(existing['_id'])
+                products_merged += 1
+            else:
+                product = {
+                    'name': name,
+                    'icon': p.get('icon') or '📦',
+                    'description': p.get('description') or '',
+                    'status': p.get('status') or 'activo',
+                    'color': p.get('color') or '#00e5ff',
+                    'sort_order': db.products.count_documents({}) + 1,
+                    'created_at': now, 'updated_at': now,
+                }
+                pid = str(db.products.insert_one(product).inserted_id)
+                products_created += 1
             for t in (p.get('tasks') or []):
                 if not isinstance(t, dict):
                     continue
                 status   = t.get('status')   if t.get('status')   in _TASK_STATUS   else 'todo'
                 priority = t.get('priority') if t.get('priority') in _TASK_PRIORITY else 'medio'
                 impact   = t.get('impact')   if t.get('impact')   in _TASK_IMPACT   else 'medio'
-                task = {
-                    'product_id': pid,
-                    'module': t.get('module') or 'Backend',
-                    'name': str(t.get('name', '')).strip(),
+                tname    = str(t.get('name', '')).strip()
+                module   = t.get('module') or 'Backend'
+                fields = {
                     'description': t.get('description') or '',
                     'status': status, 'priority': priority, 'impact': impact,
-                    'created_at': now, 'updated_at': now,
+                    'updated_at': now,
                 }
-                apply_completion(task, status, now)
-                db.tasks.insert_one(task)
-                n_tasks += 1
-        return jsonify({'ok': True, 'products_imported': n_products, 'tasks_imported': n_tasks})
+                apply_completion(fields, status, now)
+                match = db.tasks.find_one({
+                    'product_id': pid,
+                    'name':   {'$regex': '^%s$' % re.escape(tname),  '$options': 'i'},
+                    'module': {'$regex': '^%s$' % re.escape(module), '$options': 'i'},
+                })
+                if match:
+                    db.tasks.update_one({'_id': match['_id']}, {'$set': fields})
+                    tasks_updated += 1
+                else:
+                    task = {
+                        'product_id': pid, 'module': module, 'name': tname,
+                        'created_at': now,
+                    }
+                    task.update(fields)
+                    db.tasks.insert_one(task)
+                    tasks_created += 1
+        return jsonify({
+            'ok': True,
+            'products_created': products_created,
+            'products_merged':  products_merged,
+            'tasks_created':    tasks_created,
+            'tasks_updated':    tasks_updated,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/import-logs', methods=['POST'])
+def import_logs_yaml():
+    if yaml is None:
+        return jsonify({'error': 'PyYAML no está instalado en el servidor'}), 500
+    # Mismo manejo de input que import_yaml: YAML crudo o JSON {"yaml": "..."}.
+    raw = None
+    if request.is_json:
+        raw = (request.json or {}).get('yaml')
+    if raw is None:
+        raw = request.get_data(as_text=True)
+    if not raw or not raw.strip():
+        return jsonify({'error': 'El archivo está vacío'}), 400
+
+    # ── VALIDACIÓN (antes de tocar la base) ──────────────────────────────────
+    try:
+        data = yaml.safe_load(raw)
+    except Exception as e:
+        return jsonify({'error': 'YAML inválido: %s' % e}), 400
+    if not isinstance(data, dict):
+        return jsonify({'error': 'Formato inesperado: se esperaba un mapa en la raíz'}), 400
+    if 'command_center_logs_export' not in data:
+        return jsonify({'error': 'No es un export de logs de Command Center (falta command_center_logs_export)'}), 400
+    logs = data.get('logs')
+    if not isinstance(logs, list):
+        return jsonify({'error': "El campo 'logs' debe ser una lista"}), 400
+    for l in logs:
+        if not isinstance(l, dict):
+            return jsonify({'error': 'Cada log debe ser un mapa'}), 400
+
+    # ── MERGE idempotente: firma (type, title, date, text) evita duplicar ────
+    try:
+        now = datetime.utcnow()
+        seen = set()
+        for r in db.strategy_logs.find():
+            seen.add((r.get('type', ''), r.get('title', ''), r.get('date', ''), r.get('text', '')))
+        n_imported = n_skipped = 0
+        for l in logs:
+            links = l.get('links')
+            log = {
+                'type':  l.get('type') or 'Insight',
+                'title': l.get('title') or '',
+                'text':  l.get('text') or '',
+                'links': links if isinstance(links, list) else [],
+                'date':  l.get('date') or datetime.now().strftime('%Y-%m-%d'),
+            }
+            sig = (log['type'], log['title'], log['date'], log['text'])
+            if sig in seen:
+                n_skipped += 1
+                continue
+            seen.add(sig)
+            log['created_at'] = now
+            db.strategy_logs.insert_one(log)
+            n_imported += 1
+        return jsonify({'ok': True, 'logs_imported': n_imported, 'logs_skipped': n_skipped})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -2361,6 +2477,8 @@ input,select,textarea{font-family:inherit;}
           <button class="btn btn-sm" onclick="setLogFilter(this,'Hipótesis')">🔬 Hipótesis</button>
           <button class="btn btn-sm" onclick="setLogFilter(this,'Hito')">🏆 Hito</button>
         </div>
+        <button class="btn btn-sm" onclick="doExportLogs()" title="Exportar logs a YAML">⬇</button>
+        <button class="btn btn-sm" onclick="openImportLogsModal()" title="Importar logs desde YAML">⬆</button>
         <button class="btn btn-primary" onclick="openLogModal()">+ Log</button>
       </div>
     </div>
