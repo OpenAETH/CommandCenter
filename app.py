@@ -271,6 +271,121 @@ def delete_task(tid):
         return jsonify({'error': str(e)}), 500
 
 # ============================================================================
+# ACTIVIDADES — Panel de control con diagrama de Gantt
+# ============================================================================
+# Dos colecciones: activity_phases (las "filas de grupo" del Gantt — Campaña,
+# Sprints, etc., con su color de acento) y activities (las barras/hitos dentro
+# de cada fase, con start_date/end_date). Mismo patrón CRUD que products/tasks.
+
+@app.route('/api/activity-phases', methods=['GET'])
+def get_activity_phases():
+    try:
+        return jsonify([doc(r) for r in db.activity_phases.find().sort([('sort_order', 1), ('_id', 1)])])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/activity-phases', methods=['POST'])
+def create_activity_phase():
+    d = request.json
+    try:
+        now = datetime.utcnow()
+        phase = {
+            'name': d.get('name'), 'icon': d.get('icon', '📌'),
+            'color': d.get('color', '#00e5ff'),
+            'sort_order': db.activity_phases.count_documents({}) + 1,
+            'created_at': now, 'updated_at': now,
+        }
+        result = db.activity_phases.insert_one(phase)
+        phase['_id'] = result.inserted_id
+        return jsonify(doc(phase)), 201
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/activity-phases/<string:phid>', methods=['PUT'])
+def update_activity_phase(phid):
+    d = request.json
+    try:
+        update = {
+            'name': d.get('name'), 'icon': d.get('icon', '📌'),
+            'color': d.get('color', '#00e5ff'), 'updated_at': datetime.utcnow(),
+        }
+        result = db.activity_phases.find_one_and_update(
+            {'_id': oid(phid)}, {'$set': update}, return_document=True)
+        if not result:
+            return jsonify({'error': 'Phase not found'}), 404
+        return jsonify(doc(result))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/activity-phases/<string:phid>', methods=['DELETE'])
+def delete_activity_phase(phid):
+    try:
+        db.activities.delete_many({'phase_id': phid})
+        db.activity_phases.delete_one({'_id': oid(phid)})
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/activities', methods=['GET'])
+def get_activities():
+    try:
+        return jsonify([doc(r) for r in db.activities.find().sort([('phase_id', 1), ('start_date', 1), ('_id', 1)])])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/activities', methods=['POST'])
+def create_activity():
+    d = request.json
+    try:
+        now = datetime.utcnow()
+        start = d.get('start_date')
+        activity = {
+            'phase_id': d.get('phase_id'), 'name': d.get('name'),
+            'owner': d.get('owner', ''),
+            'start_date': start,
+            'end_date': d.get('end_date') or start,
+            'is_milestone': 1 if d.get('is_milestone') else 0,
+            'status': d.get('status', 'todo'),
+            'sort_order': db.activities.count_documents({}) + 1,
+            'created_at': now, 'updated_at': now,
+        }
+        result = db.activities.insert_one(activity)
+        activity['_id'] = result.inserted_id
+        return jsonify(doc(activity)), 201
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/activities/<string:aid>', methods=['PUT'])
+def update_activity(aid):
+    d = request.json
+    try:
+        start = d.get('start_date')
+        update = {
+            'phase_id': d.get('phase_id'), 'name': d.get('name'),
+            'owner': d.get('owner', ''),
+            'start_date': start,
+            'end_date': d.get('end_date') or start,
+            'is_milestone': 1 if d.get('is_milestone') else 0,
+            'status': d.get('status', 'todo'),
+            'updated_at': datetime.utcnow(),
+        }
+        result = db.activities.find_one_and_update(
+            {'_id': oid(aid)}, {'$set': update}, return_document=True)
+        if not result:
+            return jsonify({'error': 'Activity not found'}), 404
+        return jsonify(doc(result))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/activities/<string:aid>', methods=['DELETE'])
+def delete_activity(aid):
+    try:
+        db.activities.delete_one({'_id': oid(aid)})
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ============================================================================
 # CAMPAÑA — DASHBOARD DE LA DESARROLLADORA (datos derivados del módulo DEV)
 # ============================================================================
 
@@ -430,6 +545,8 @@ def get_stats():
             'logs_total':      db.strategy_logs.count_documents({}),
             'products_total':  db.products.count_documents({}),
             'products_active': db.products.count_documents({'status': 'activo'}),
+            'activities_total': db.activities.count_documents({}),
+            'activity_phases_total': db.activity_phases.count_documents({}),
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -2002,6 +2119,49 @@ input,select,textarea{font-family:inherit;}
 .cs-stat{font-size:10px;color:var(--text2);}
 .cs-stat span{color:var(--text1);font-weight:700;}
 
+/* ══ ACTIVIDADES / GANTT ══ */
+.activities-body{flex:1;overflow-y:auto;display:flex;flex-direction:column;}
+.gantt-legend{display:flex;gap:14px;flex-wrap:wrap;padding:10px 18px;border-bottom:1px solid var(--border);background:var(--bg1);flex-shrink:0;}
+.gantt-legend-item{display:flex;align-items:center;gap:6px;font-size:10px;color:var(--text1);}
+.gantt-legend-dot{width:8px;height:8px;border-radius:2px;flex-shrink:0;}
+.gantt-legend-empty{font-size:10px;color:var(--text3);}
+.gantt-scroll{flex:1;overflow:auto;padding:0 18px 18px;}
+.gantt-inner{min-width:640px;}
+.gantt-row-flex{display:flex;}
+.gantt-label-cell{position:sticky;left:0;z-index:5;width:230px;flex-shrink:0;background:var(--bg0);
+  padding:8px 12px;box-shadow:2px 0 0 var(--border);}
+.gantt-header-row .gantt-label-cell{background:var(--bg1);font-size:9px;color:var(--text2);
+  letter-spacing:.1em;text-transform:uppercase;display:flex;align-items:center;}
+.gantt-header-row{position:sticky;top:0;z-index:6;background:var(--bg1);border-bottom:1px solid var(--border2);}
+.gantt-months{flex:1;position:relative;height:22px;background:var(--bg1);}
+.gantt-month{position:absolute;top:0;height:100%;display:flex;align-items:center;padding-left:6px;
+  font-size:9px;font-weight:700;letter-spacing:.08em;color:var(--text1);border-left:1px solid var(--border2);
+  text-transform:uppercase;white-space:nowrap;overflow:hidden;}
+.gantt-weeks{flex:1;position:relative;height:14px;background:var(--bg1);border-bottom:1px solid var(--border);}
+.gantt-phase-head{background:var(--bg2);border-top:1px solid var(--border);}
+.gantt-phase-head .gantt-label-cell{background:var(--bg2);font-family:var(--sans);font-size:11px;
+  font-weight:800;display:flex;align-items:center;gap:6px;}
+.gantt-phase-head-timeline{flex:1;background:var(--bg2);}
+.gantt-phase-actions{display:none;gap:3px;margin-left:auto;}
+.gantt-phase-head:hover .gantt-phase-actions{display:flex;}
+.gantt-row{border-top:1px solid var(--border);transition:background .1s;}
+.gantt-row:hover{background:rgba(255,255,255,.015);}
+.gantt-row-name{font-size:11px;color:var(--text0);line-height:1.3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.gantt-row-owner{font-size:9px;color:var(--text2);margin-top:2px;}
+.gantt-row-actions{display:none;gap:3px;margin-top:4px;}
+.gantt-row:hover .gantt-row-actions{display:flex;}
+.gantt-timeline{flex:1;position:relative;min-height:40px;}
+.gantt-bar{position:absolute;top:9px;height:20px;border-radius:4px;cursor:pointer;
+  display:flex;align-items:center;padding:0 8px;overflow:hidden;box-shadow:0 2px 6px rgba(0,0,0,.35);
+  transition:filter .12s;}
+.gantt-bar:hover{filter:brightness(1.2);}
+.gantt-bar-label{font-size:9px;font-weight:700;color:var(--bg0);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.gantt-bar.is-done{opacity:.55;}
+.gantt-milestone{position:absolute;top:8px;width:16px;height:16px;transform:translateX(-50%) rotate(45deg);
+  cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.4);}
+.gantt-today{position:absolute;top:0;bottom:0;width:1px;background:var(--red);z-index:2;}
+.gantt-today::before{content:'HOY';position:absolute;top:-14px;left:2px;font-size:8px;color:var(--red);letter-spacing:.05em;}
+
 /* ══ STRATEGY ══ */
 .strategy-body{flex:1;overflow-y:auto;padding:14px 18px;display:flex;flex-direction:column;gap:7px;}
 .log-entry{background:var(--bg1);border:1px solid var(--border);
@@ -2221,6 +2381,7 @@ input,select,textarea{font-family:inherit;}
 .mb-nav-tab[data-panel="campaign"]{--tab-color:var(--purple-light);}
 .mb-nav-tab[data-panel="strategy"]{--tab-color:var(--green);}
 .mb-nav-tab[data-panel="guide"]{--tab-color:var(--gold);}
+.mb-nav-tab[data-panel="activities"]{--tab-color:var(--cyan);}
 .mb-chat-btn{--tab-color:var(--purple);}
 .mb-icon{font-size:18px;line-height:1;}
 .mb-label{font-size:9px;letter-spacing:.05em;text-transform:uppercase;}
@@ -2372,6 +2533,9 @@ input,select,textarea{font-family:inherit;}
     <button class="nav-tab" style="--tab-color:var(--gold)" data-panel="guide" onclick="switchPanel('guide',this)">
       📖 GUÍA
     </button>
+    <button class="nav-tab" style="--tab-color:var(--cyan)" data-panel="activities" onclick="switchPanel('activities',this)">
+      📊 ACTIVIDADES <span class="nav-badge" id="nb-act" style="background:var(--cyan)">0</span>
+    </button>
   </div>
   <div class="topbar-right">
     <div class="topbar-stat"><div class="topbar-stat-val" id="ts-todo">—</div><div class="topbar-stat-label">tasks todo</div></div>
@@ -2396,6 +2560,9 @@ input,select,textarea{font-family:inherit;}
       🧠 Estrategia <span class="sidebar-link-badge" style="background:var(--green)" id="slb-str">0</span>
     </button>
     <button class="sidebar-link" style="--lc:var(--gold)" id="sl-guide" onclick="switchPanel('guide')">📖 Guía</button>
+    <button class="sidebar-link" style="--lc:var(--cyan)" id="sl-activities" onclick="switchPanel('activities')">
+      📊 Actividades <span class="sidebar-link-badge" style="background:var(--cyan)" id="slb-act">0</span>
+    </button>
   </div>
   <div class="sidebar-div"></div>
   <div class="sidebar-section">
@@ -2643,6 +2810,21 @@ input,select,textarea{font-family:inherit;}
     </div><!-- /guide-body -->
   </div><!-- /panel-guide -->
 
+  <!-- ACTIVIDADES (Gantt) -->
+  <div class="panel" id="panel-activities">
+    <div class="panel-header">
+      <div class="panel-title" style="color:var(--cyan)">📊 ACTIVIDADES <span class="panel-sub">— Panel de control · diagrama de Gantt</span></div>
+      <div class="panel-actions">
+        <button class="btn btn-sm" onclick="openPhaseModal()">+ Fase</button>
+        <button class="btn btn-primary" onclick="openActivityModal()">+ Actividad</button>
+      </div>
+    </div>
+    <div class="activities-body">
+      <div class="gantt-legend" id="gantt-legend"></div>
+      <div class="gantt-scroll"><div class="gantt-inner" id="gantt-inner"></div></div>
+    </div>
+  </div>
+
 </div><!-- /main -->
 </div><!-- /body-area -->
 </div><!-- /shell -->
@@ -2666,6 +2848,11 @@ input,select,textarea{font-family:inherit;}
   <button class="mb-nav-tab" data-panel="guide" onclick="switchPanel('guide',this)">
     <span class="mb-icon">📖</span>
     <span class="mb-label">GUÍA</span>
+  </button>
+  <button class="mb-nav-tab" data-panel="activities" onclick="switchPanel('activities',this)">
+    <span class="mb-icon">📊</span>
+    <span class="mb-label">ACTIV.</span>
+    <span class="mb-badge" id="mb-badge-act">0</span>
   </button>
   <button class="mb-nav-tab mb-chat-btn" onclick="toggleChat()">
     <span class="mb-icon">🤖</span>
@@ -2739,6 +2926,63 @@ input,select,textarea{font-family:inherit;}
     <div class="modal-foot">
       <button class="btn btn-danger btn-sm" id="product-del-btn" onclick="deleteProduct()" style="display:none">🗑 Eliminar</button>
       <div style="display:flex;gap:7px"><button class="btn" onclick="closeModal('modal-product')">Cancelar</button><button class="btn btn-primary" onclick="saveProduct()">Guardar</button></div>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL FASE (Actividades/Gantt) -->
+<div class="overlay" id="modal-phase" onclick="overlayClose(event,'modal-phase')">
+  <div class="modal">
+    <div class="modal-head"><div class="modal-title" id="phase-modal-title">Nueva Fase</div><button class="modal-close" onclick="closeModal('modal-phase')">✕</button></div>
+    <div class="modal-body">
+      <input type="hidden" id="ph-id"/>
+      <div class="f-row">
+        <div class="f-group"><label class="f-label">Nombre *</label><input class="f-input" id="ph-name" placeholder="Ej: Campaña, Sprints..."/></div>
+        <div class="f-group"><label class="f-label">Ícono</label><input class="f-input" id="ph-icon" placeholder="📌" maxlength="4"/></div>
+      </div>
+      <div class="f-group"><label class="f-label">Color de acento</label>
+        <select class="f-select" id="ph-color">
+          <option value="#00e5ff">⬡ Cyan</option>
+          <option value="#39ff14">⬡ Verde</option>
+          <option value="#ff9f43">⬡ Naranja</option>
+          <option value="#a87fff">⬡ Púrpura</option>
+          <option value="#ff6b35">⬡ Rojo-naranja</option>
+          <option value="#ffd700">⬡ Amarillo</option>
+          <option value="#ff3e5e">⬡ Rojo</option>
+        </select>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-danger btn-sm" id="phase-del-btn" onclick="deletePhase()" style="display:none">🗑 Eliminar</button>
+      <div style="display:flex;gap:7px"><button class="btn" onclick="closeModal('modal-phase')">Cancelar</button><button class="btn btn-primary" onclick="savePhase()">Guardar</button></div>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL ACTIVIDAD (Gantt) -->
+<div class="overlay" id="modal-activity" onclick="overlayClose(event,'modal-activity')">
+  <div class="modal">
+    <div class="modal-head"><div class="modal-title" id="activity-modal-title">Nueva Actividad</div><button class="modal-close" onclick="closeModal('modal-activity')">✕</button></div>
+    <div class="modal-body">
+      <input type="hidden" id="a-id"/>
+      <div class="f-group"><label class="f-label">Fase *</label><select class="f-select" id="a-phase"></select></div>
+      <div class="f-group"><label class="f-label">Nombre *</label><input class="f-input" id="a-name" placeholder="Nombre de la actividad o tarea..."/></div>
+      <div class="f-row">
+        <div class="f-group"><label class="f-label">Responsable</label><input class="f-input" id="a-owner" placeholder="Guido / Consultor..."/></div>
+        <div class="f-group"><label class="f-label">Estado</label><select class="f-select" id="a-status"><option value="todo">⬜ Todo</option><option value="doing">🔶 Doing</option><option value="done">✅ Done</option></select></div>
+      </div>
+      <div class="f-row">
+        <div class="f-group"><label class="f-label">Inicio *</label><input class="f-input" id="a-start" type="date"/></div>
+        <div class="f-group"><label class="f-label">Fin</label><input class="f-input" id="a-end" type="date"/></div>
+      </div>
+      <div class="f-group" style="flex-direction:row;align-items:center;gap:8px">
+        <input type="checkbox" id="a-milestone" style="width:14px;height:14px"/>
+        <label class="f-label" style="text-transform:none;font-size:11px;color:var(--text1)" for="a-milestone">◆ Es un hito (fecha única, sin duración)</label>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-danger btn-sm" id="activity-del-btn" onclick="deleteActivity()" style="display:none">🗑 Eliminar</button>
+      <div style="display:flex;gap:7px"><button class="btn" onclick="closeModal('modal-activity')">Cancelar</button><button class="btn btn-primary" onclick="saveActivity()">Guardar</button></div>
     </div>
   </div>
 </div>
@@ -2832,7 +3076,7 @@ input,select,textarea{font-family:inherit;}
 
 <script>
 const API='';
-let STATE={tasks:[],devMetrics:{},logs:[],stats:{},products:[]};
+let STATE={tasks:[],devMetrics:{},logs:[],stats:{},products:[],activityPhases:[],activities:[]};
 let logFilter='';
 let modExp={Auth:true,Backend:true,UI:true,'Multi-IA':true};
 let charts={weekly:null,status:null};
@@ -2858,7 +3102,7 @@ async function api(path,method='GET',body=null){
 
 async function boot(){
   try{
-    await Promise.all([loadProducts(),loadTasks(),loadDevMetrics(),loadLogs(),loadStats()]);
+    await Promise.all([loadProducts(),loadTasks(),loadDevMetrics(),loadLogs(),loadStats(),loadActivityPhases(),loadActivities()]);
     const old=document.getElementById('boot-err');if(old)old.remove();
     render();
   }catch(e){
@@ -2881,7 +3125,9 @@ async function loadTasks(){STATE.tasks=await api('/api/tasks');}
 async function loadDevMetrics(){STATE.devMetrics=await api('/api/dev-metrics');}
 async function loadLogs(){STATE.logs=await api('/api/logs');}
 async function loadStats(){STATE.stats=await api('/api/stats');}
-function render(){renderDev();renderCampaign();renderStrategy();renderStats();}
+async function loadActivityPhases(){STATE.activityPhases=await api('/api/activity-phases');}
+async function loadActivities(){STATE.activities=await api('/api/activities');}
+function render(){renderDev();renderCampaign();renderStrategy();renderStats();renderActivities();}
 
 // panel switch
 function switchPanel(name,btnEl){
@@ -2937,6 +3183,8 @@ function renderStats(){
   if(devTaskEl) devTaskEl.textContent=(s.tasks_doing||0)+' doing';
   setText('nb-str',s.logs_total||0);setText('slb-str',s.logs_total||0);
   setText('mb-badge-str',s.logs_total||0);
+  setText('nb-act',s.activities_total||0);setText('slb-act',s.activities_total||0);
+  setText('mb-badge-act',s.activities_total||0);
 }
 
 // ══ DEV ══
@@ -3142,6 +3390,213 @@ async function deleteProduct(){
   const id=document.getElementById('product-id').value;if(!id)return;
   if(!await confirmDialog({title:'Eliminar producto',message:'¿Eliminar el producto y todas sus tasks? Esta acción no se puede deshacer.',okText:'Eliminar'}))return;
   try{await api('/api/products/'+id,'DELETE');closeModal('modal-product');await loadProducts();await loadTasks();await loadStats();renderDev();renderStats();toast('Producto eliminado','error');}
+  catch(e){toast(e.message,'error');}
+}
+
+// ══ ACTIVIDADES — Panel de control con diagrama de Gantt ══
+const MESES=['ENE','FEB','MAR','ABR','MAY','JUN','JUL','AGO','SEP','OCT','NOV','DIC'];
+function parseD(s){
+  if(!s)return null;
+  const parts=s.split('-').map(Number);
+  if(parts.length!==3||parts.some(isNaN))return null;
+  return new Date(Date.UTC(parts[0],parts[1]-1,parts[2]));
+}
+function addDaysD(d,n){const r=new Date(d);r.setUTCDate(r.getUTCDate()+n);return r;}
+function daysBetweenD(a,b){return Math.round((b-a)/86400000);}
+
+function renderActivities(){
+  const legend=document.getElementById('gantt-legend');
+  const inner=document.getElementById('gantt-inner');
+  if(!legend||!inner)return;
+  if(!STATE.activityPhases.length){
+    legend.innerHTML='<span class="gantt-legend-empty">Sin fases todavía.</span>';
+    inner.innerHTML='<div class="empty"><div class="empty-icon">📊</div>Sin fases. Creá una con + Fase para empezar tu Gantt.</div>';
+    return;
+  }
+  legend.innerHTML=STATE.activityPhases.map(p=>
+    `<div class="gantt-legend-item"><div class="gantt-legend-dot" style="background:${p.color}"></div>${p.icon||'📌'} ${escapeHtml(p.name)}</div>`
+  ).join('')+'<div class="gantt-legend-item"><span style="color:var(--red)">┃</span> Hoy</div>';
+
+  if(!STATE.activities.length){
+    inner.innerHTML='<div class="empty"><div class="empty-icon">📊</div>Sin actividades. Creá una con + Actividad.</div>';
+    inner.style.minWidth='';
+    return;
+  }
+  let minD=null,maxD=null;
+  STATE.activities.forEach(a=>{
+    const s=parseD(a.start_date),e=parseD(a.end_date||a.start_date)||s;
+    if(!s)return;
+    if(!minD||s<minD)minD=s;
+    if(e&&(!maxD||e>maxD))maxD=e;
+  });
+  if(!minD){inner.innerHTML='<div class="empty">Ninguna actividad tiene una fecha de inicio válida.</div>';return;}
+  const startWD=(minD.getUTCDay()+6)%7;
+  let rangeStart=addDaysD(minD,-startWD);
+  const endWD=(maxD.getUTCDay()+6)%7;
+  let rangeEnd=addDaysD(maxD,(6-endWD)+7);
+  let totalDays=daysBetweenD(rangeStart,rangeEnd);
+  const numWeeks=Math.max(4,Math.ceil(totalDays/7));
+  totalDays=numWeeks*7;
+  rangeEnd=addDaysD(rangeStart,totalDays);
+  const weekPct=100/numWeeks;
+  const gridBg=`background-image:repeating-linear-gradient(to right, var(--border) 0, var(--border) 1px, transparent 1px, transparent ${weekPct}%)`;
+
+  const months=[];
+  let cursor=rangeStart;
+  while(cursor<rangeEnd){
+    const y=cursor.getUTCFullYear(),m=cursor.getUTCMonth();
+    const next=new Date(Date.UTC(y,m+1,1));
+    const bEnd=next<rangeEnd?next:rangeEnd;
+    months.push({
+      label:MESES[m]+' '+y,
+      left:daysBetweenD(rangeStart,cursor)/totalDays*100,
+      width:daysBetweenD(cursor,bEnd)/totalDays*100
+    });
+    cursor=next;
+  }
+  const now=new Date();
+  const todayU=new Date(Date.UTC(now.getFullYear(),now.getMonth(),now.getDate()));
+  const todayPct=(todayU>=rangeStart&&todayU<=rangeEnd)?daysBetweenD(rangeStart,todayU)/totalDays*100:null;
+  const todayHTML=todayPct!=null?`<div class="gantt-today" style="left:${todayPct}%"></div>`:'';
+
+  let html=`<div class="gantt-row-flex gantt-header-row">
+    <div class="gantt-label-cell">Fase / Actividad</div>
+    <div class="gantt-months" style="${gridBg}">
+      ${months.map(m=>`<div class="gantt-month" style="left:${m.left}%;width:${m.width}%">${m.label}</div>`).join('')}
+      ${todayHTML}
+    </div>
+  </div>`;
+
+  STATE.activityPhases.forEach(ph=>{
+    const acts=STATE.activities.filter(a=>a.phase_id===ph.id)
+      .sort((a,b)=>(a.start_date||'').localeCompare(b.start_date||''));
+    html+=`<div class="gantt-row-flex gantt-phase-head">
+      <div class="gantt-label-cell" style="border-left:3px solid ${ph.color}">
+        ${ph.icon||'📌'} ${escapeHtml(ph.name)}
+        <div class="gantt-phase-actions">
+          <button class="ca-btn" onclick="openPhaseModal('${ph.id}')" title="Editar fase">✎</button>
+          <button class="ca-btn" onclick="openActivityModal(null,'${ph.id}')" title="Nueva actividad en esta fase">+</button>
+        </div>
+      </div>
+      <div class="gantt-phase-head-timeline" style="${gridBg}">${todayHTML}</div>
+    </div>`;
+    if(!acts.length){
+      html+=`<div class="gantt-row-flex gantt-row">
+        <div class="gantt-label-cell" style="border-left:3px solid ${ph.color};color:var(--text3);font-size:10px">Sin actividades en esta fase</div>
+        <div class="gantt-timeline" style="${gridBg}">${todayHTML}</div>
+      </div>`;
+      return;
+    }
+    acts.forEach(a=>{
+      const s=parseD(a.start_date);if(!s)return;
+      const e=parseD(a.end_date||a.start_date)||s;
+      const left=daysBetweenD(rangeStart,s)/totalDays*100;
+      const isMilestone=!!a.is_milestone||daysBetweenD(s,e)===0;
+      let bar;
+      if(isMilestone){
+        bar=`<div class="gantt-milestone" style="left:${left}%;background:${ph.color}" title="${escapeHtml(a.name)} · ${a.start_date}" onclick="openActivityModal('${a.id}')"></div>`;
+      }else{
+        const width=Math.max(daysBetweenD(s,e)/totalDays*100,0.8);
+        bar=`<div class="gantt-bar ${a.status==='done'?'is-done':''}" style="left:${left}%;width:${width}%;background:${ph.color}" title="${escapeHtml(a.name)} · ${a.start_date} → ${a.end_date||a.start_date}" onclick="openActivityModal('${a.id}')"><span class="gantt-bar-label">${escapeHtml(a.name)}</span></div>`;
+      }
+      html+=`<div class="gantt-row-flex gantt-row">
+        <div class="gantt-label-cell" style="border-left:3px solid ${ph.color}">
+          <div class="gantt-row-name">${escapeHtml(a.name)}</div>
+          ${a.owner?`<div class="gantt-row-owner">${escapeHtml(a.owner)}</div>`:''}
+          <div class="gantt-row-actions"><span class="sp sp-${a.status||'todo'}">${a.status||'todo'}</span><button class="ca-btn" onclick="openActivityModal('${a.id}')" title="Editar">✎</button></div>
+        </div>
+        <div class="gantt-timeline" style="${gridBg}">${todayHTML}${bar}</div>
+      </div>`;
+    });
+  });
+
+  inner.innerHTML=html;
+  inner.style.minWidth=(230+numWeeks*70)+'px';
+}
+
+// ── FASES CRUD ──
+function fillPhaseSelect(selectedId=null){
+  const sel=document.getElementById('a-phase');
+  if(!sel)return;
+  sel.innerHTML=STATE.activityPhases.map(p=>`<option value="${p.id}" ${p.id==selectedId?'selected':''}>${p.icon||'📌'} ${p.name}</option>`).join('');
+}
+function openPhaseModal(id=null){
+  document.getElementById('ph-id').value='';
+  document.getElementById('ph-name').value='';
+  document.getElementById('ph-icon').value='📌';
+  document.getElementById('ph-color').value='#00e5ff';
+  const del=document.getElementById('phase-del-btn');
+  if(id){
+    const p=STATE.activityPhases.find(x=>x.id===id);if(!p)return;
+    document.getElementById('phase-modal-title').textContent='Editar Fase';
+    document.getElementById('ph-id').value=id;
+    document.getElementById('ph-name').value=p.name||'';
+    document.getElementById('ph-icon').value=p.icon||'📌';
+    document.getElementById('ph-color').value=p.color||'#00e5ff';
+    del.style.display='block';
+  }else{document.getElementById('phase-modal-title').textContent='Nueva Fase';del.style.display='none';}
+  openModal('modal-phase');
+}
+async function savePhase(){
+  const name=document.getElementById('ph-name').value.trim();if(!name){shake('ph-name');return;}
+  const id=document.getElementById('ph-id').value;
+  const data={name,icon:v('ph-icon')||'📌',color:v('ph-color')};
+  try{
+    if(id){await api('/api/activity-phases/'+id,'PUT',data);toast('Fase actualizada','success');}
+    else{await api('/api/activity-phases','POST',data);toast('Fase creada','success');}
+    closeModal('modal-phase');await loadActivityPhases();await loadActivities();await loadStats();renderActivities();renderStats();
+  }catch(e){toast(e.message,'error');}
+}
+async function deletePhase(){
+  const id=document.getElementById('ph-id').value;if(!id)return;
+  if(!await confirmDialog({title:'Eliminar fase',message:'¿Eliminar la fase y todas sus actividades? Esta acción no se puede deshacer.',okText:'Eliminar'}))return;
+  try{await api('/api/activity-phases/'+id,'DELETE');closeModal('modal-phase');await loadActivityPhases();await loadActivities();await loadStats();renderActivities();renderStats();toast('Fase eliminada','error');}
+  catch(e){toast(e.message,'error');}
+}
+
+// ── ACTIVIDADES CRUD ──
+function openActivityModal(id=null,defaultPhaseId=null){
+  if(!STATE.activityPhases.length){toast('Creá primero una fase con + Fase','error');return;}
+  document.getElementById('a-id').value='';
+  document.getElementById('a-name').value='';
+  document.getElementById('a-owner').value='';
+  document.getElementById('a-status').value='todo';
+  document.getElementById('a-start').value='';
+  document.getElementById('a-end').value='';
+  document.getElementById('a-milestone').checked=false;
+  fillPhaseSelect(defaultPhaseId||STATE.activityPhases[0].id);
+  const del=document.getElementById('activity-del-btn');
+  if(id){
+    const a=STATE.activities.find(x=>x.id===id);if(!a)return;
+    document.getElementById('activity-modal-title').textContent='Editar Actividad';
+    document.getElementById('a-id').value=id;
+    fillPhaseSelect(a.phase_id);
+    document.getElementById('a-name').value=a.name||'';
+    document.getElementById('a-owner').value=a.owner||'';
+    document.getElementById('a-status').value=a.status||'todo';
+    document.getElementById('a-start').value=a.start_date||'';
+    document.getElementById('a-end').value=a.end_date||a.start_date||'';
+    document.getElementById('a-milestone').checked=!!a.is_milestone;
+    del.style.display='block';
+  }else{document.getElementById('activity-modal-title').textContent='Nueva Actividad';del.style.display='none';}
+  openModal('modal-activity');
+}
+async function saveActivity(){
+  const name=document.getElementById('a-name').value.trim();if(!name){shake('a-name');return;}
+  const start=document.getElementById('a-start').value;if(!start){shake('a-start');return;}
+  const id=document.getElementById('a-id').value;
+  const data={phase_id:v('a-phase'),name,owner:v('a-owner'),status:v('a-status'),
+    start_date:start,end_date:v('a-end')||start,is_milestone:document.getElementById('a-milestone').checked};
+  try{
+    if(id){await api('/api/activities/'+id,'PUT',data);toast('Actividad actualizada','success');}
+    else{await api('/api/activities','POST',data);toast('Actividad creada','success');}
+    closeModal('modal-activity');await loadActivities();await loadStats();renderActivities();renderStats();
+  }catch(e){toast(e.message,'error');}
+}
+async function deleteActivity(){
+  const id=document.getElementById('a-id').value;if(!id)return;
+  if(!await confirmDialog({title:'Eliminar actividad',message:'¿Eliminar esta actividad? Esta acción no se puede deshacer.',okText:'Eliminar'}))return;
+  try{await api('/api/activities/'+id,'DELETE');closeModal('modal-activity');await loadActivities();await loadStats();renderActivities();renderStats();toast('Actividad eliminada','error');}
   catch(e){toast(e.message,'error');}
 }
 
@@ -3405,7 +3860,7 @@ function toast(msg,type='info'){
 document.addEventListener('keydown',e=>{
   if(e.key==='Escape'){if(_confirmResolve)resolveConfirm(false);document.querySelectorAll('.overlay.open').forEach(o=>o.classList.remove('open'));closeSidebar();return;}
   if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA'||e.target.tagName==='SELECT')return;
-  const map={'1':'dev','2':'campaign','3':'strategy','4':'guide'};
+  const map={'1':'dev','2':'campaign','3':'strategy','4':'guide','5':'activities'};
   if(map[e.key])switchPanel(map[e.key]);
 });
 // ══ CHATBOT ══
