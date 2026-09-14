@@ -5,5 +5,5 @@ pymongo==4.10.1
 certifi
 dnspython
 groq
-headroom-ai==0.26.0
+headroom-ai==0.27.0
 pyyaml==6.0.2
